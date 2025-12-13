@@ -2,7 +2,10 @@
 set -euo pipefail
 
 # =============================================================================
-# SAFEEXEC: Destructive Command Interceptor
+# SAFEEXEC: Destructive Command Interceptor (+ on/off toggle)
+# - Gates: rm -rf, git reset/revert/checkout/restore (+ clean -f, switch -f, stash drop/clear/pop)
+# - Cross-platform: Linux VPS + macOS
+# - Adds: `safeexec -on|-off|status` (per-user toggle)
 # =============================================================================
 
 SAFEEXEC_DIR="/usr/local/safeexec/bin"
@@ -27,9 +30,12 @@ Usage:
   safeexec.sh install
   safeexec.sh uninstall
   safeexec.sh status
+  safeexec.sh on|off        # per-user toggle (no sudo required)
 EOF
   exit 2
 }
+
+is_darwin() { [[ "$(uname -s 2>/dev/null || true)" == "Darwin" ]]; }
 
 pick_system_bashrc() {
   if [[ -f /etc/bash.bashrc ]]; then echo /etc/bash.bashrc
@@ -39,7 +45,7 @@ pick_system_bashrc() {
 
 ensure_dir() {
   local d="$1"
-  [[ -d "$d" ]] || install -d -m 0755 "$d"
+  [[ -d "$d" ]] || mkdir -p "$d"
 }
 
 symlink_points_to() {
@@ -55,10 +61,10 @@ ensure_block_in_file() {
   local block; block="$(cat)"
 
   ensure_dir "$(dirname "$file")"
-  [[ -e "$file" ]] || touch "$file"
+  [[ -e "$file" ]] || : >"$file"
 
   if ! [[ -w "$file" ]]; then
-    echo "safeexec: WARNING: cannot modify $file (not writable); skipping."
+    echo "safeexec: WARNING: cannot modify $file; skipping."
     return 0
   fi
 
@@ -86,19 +92,15 @@ remove_block_from_file() {
   ' "$file" > "${file}.safeexec.tmp" && mv "${file}.safeexec.tmp" "$file"
 }
 
-get_target_user() {
-  local u=""
-  u="${SUDO_USER:-}"
-  if [[ -z "$u" ]]; then
-    u="${LOGNAME:-${USER:-}}"
+target_user() {
+  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER:-}" != "root" ]]; then
+    echo "$SUDO_USER"
+  else
+    id -un 2>/dev/null || echo "root"
   fi
-  if [[ -z "$u" ]]; then
-    u="$(logname 2>/dev/null || true)"
-  fi
-  echo "$u"
 }
 
-get_user_home() {
+user_home() {
   local u="$1"
   local h=""
   h="$(eval "echo ~$u" 2>/dev/null || true)"
@@ -106,56 +108,31 @@ get_user_home() {
   echo "$h"
 }
 
-get_user_group() {
-  local u="$1"
-  id -gn "$u" 2>/dev/null || echo "$u"
-}
+# =============================================================================
+# WRAPPERS
+# =============================================================================
 
-ensure_user_file() {
-  local file="$1" u="$2" g="$3"
-  if [[ ! -e "$file" ]]; then
-    ensure_dir "$(dirname "$file")"
-    if ! install -m 0644 -o "$u" -g "$g" /dev/null "$file" 2>/dev/null; then
-      : >"$file"
-      chown "$u:$g" "$file" 2>/dev/null || true
-      chmod 0644 "$file" 2>/dev/null || true
-    fi
-  fi
-}
-
-ensure_block_in_user_file() {
-  local file="$1" begin="$2" end="$3" u="$4" g="$5"
-  local block; block="$(cat)"
-
-  ensure_user_file "$file" "$u" "$g"
-
-  if ! [[ -w "$file" ]]; then
-    echo "safeexec: WARNING: cannot modify $file (not writable); skipping."
-    return 0
-  fi
-
-  if grep -Fq "$begin" "$file" 2>/dev/null; then
-    return 0
-  fi
-
-  {
-    echo ""
-    echo "$begin"
-    echo "$block"
-    echo "$end"
-    echo ""
-  } >>"$file"
-
-  chown "$u:$g" "$file" 2>/dev/null || true
-}
-
-# --- WRAPPER: RM ---
 write_wrapper_rm() {
   ensure_dir "$SAFEEXEC_DIR"
   local dst="$SAFEEXEC_DIR/rm"
   cat >"$dst" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+
+STATE_FILE_USER="${XDG_CONFIG_HOME:-$HOME/.config}/safeexec/disabled"
+STATE_FILE_GLOBAL="/usr/local/safeexec/disabled"
+
+is_disabled() {
+  [[ "${SAFEEXEC_DISABLED:-}" == "1" ]] && return 0
+  [[ -f "$STATE_FILE_GLOBAL" ]] && return 0
+  if [[ -n "${SUDO_USER:-}" ]]; then
+    local h=""
+    h="$(eval "echo ~$SUDO_USER" 2>/dev/null || true)"
+    [[ -n "$h" && -f "$h/.config/safeexec/disabled" ]] && return 0
+  fi
+  [[ -f "$STATE_FILE_USER" ]] && return 0
+  return 1
+}
 
 log_audit() {
   if command -v logger >/dev/null 2>&1; then
@@ -197,6 +174,11 @@ if [[ -z "$REAL_RM" ]]; then
   REAL_RM="$(command -p -v rm 2>/dev/null || echo '/bin/rm')"
 fi
 
+# Fast path: disabled => no prompts
+if is_disabled; then
+  exec "$REAL_RM" "$@"
+fi
+
 force=0
 rec=0
 
@@ -227,13 +209,27 @@ EOF
   chmod 0755 "$dst"
 }
 
-# --- WRAPPER: GIT ---
 write_wrapper_git() {
   ensure_dir "$SAFEEXEC_DIR"
   local dst="$SAFEEXEC_DIR/git"
   cat >"$dst" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+
+STATE_FILE_USER="${XDG_CONFIG_HOME:-$HOME/.config}/safeexec/disabled"
+STATE_FILE_GLOBAL="/usr/local/safeexec/disabled"
+
+is_disabled() {
+  [[ "${SAFEEXEC_DISABLED:-}" == "1" ]] && return 0
+  [[ -f "$STATE_FILE_GLOBAL" ]] && return 0
+  if [[ -n "${SUDO_USER:-}" ]]; then
+    local h=""
+    h="$(eval "echo ~$SUDO_USER" 2>/dev/null || true)"
+    [[ -n "$h" && -f "$h/.config/safeexec/disabled" ]] && return 0
+  fi
+  [[ -f "$STATE_FILE_USER" ]] && return 0
+  return 1
+}
 
 log_audit() {
   if command -v logger >/dev/null 2>&1; then
@@ -265,7 +261,14 @@ confirm_or_die() {
 }
 
 REAL_GIT=""
-for cand in /opt/homebrew/bin/git /usr/local/bin/git /usr/bin/git /bin/git; do
+for cand in \
+  /opt/homebrew/bin/git.safeexec.real \
+  /opt/homebrew/bin/git \
+  /usr/local/bin/git.safeexec.real \
+  /usr/local/bin/git \
+  /usr/bin/git \
+  /bin/git \
+; do
   if [[ -x "$cand" ]] && ! [[ "$cand" -ef "$0" ]]; then
     REAL_GIT="$cand"
     break
@@ -273,6 +276,11 @@ for cand in /opt/homebrew/bin/git /usr/local/bin/git /usr/bin/git /bin/git; do
 done
 if [[ -z "$REAL_GIT" ]]; then
   REAL_GIT="$(command -p -v git 2>/dev/null || echo '/usr/bin/git')"
+fi
+
+# Fast path: disabled => no prompts
+if is_disabled; then
+  exec "$REAL_GIT" "$@"
 fi
 
 args=("$@")
@@ -283,26 +291,18 @@ i=0
 while (( i < ${#args[@]} )); do
   a="${args[i]}"
   case "$a" in
-    --*=*)
-      ((i+=1)); continue ;;
+    --*=*) ((i+=1)); continue ;;
     -C|-c|--exec-path|--html-path|--man-path|--info-path|--git-dir|--work-tree|--namespace|--super-prefix)
       ((i+=2)); continue ;;
-    --)
-      ((i+=1)); break ;;
-    -*)
-      ((i+=1)); continue ;;
-    *)
-      subcmd="$a"
-      subcmd_idx=$i
-      break ;;
+    --) ((i+=1)); break ;;
+    -*) ((i+=1)); continue ;;
+    *) subcmd="$a"; subcmd_idx=$i; break ;;
   esac
 done
 
 should_gate=0
-
 if [[ -n "$subcmd" ]]; then
   case "$subcmd" in
-    # Always gate per requirement
     reset|revert|checkout|restore)
       should_gate=1
       ;;
@@ -335,10 +335,12 @@ EOF
   chmod 0755 "$dst"
 }
 
-# --- /usr/local/bin shims ---
+# =============================================================================
+# SHIMS + macOS Homebrew git shim (for /opt/homebrew/bin precedence)
+# =============================================================================
+
 install_localbin_shims() {
   ensure_dir "$LOCALBIN"
-
   for c in rm git; do
     local target="$LOCALBIN/$c"
     local src="$SAFEEXEC_DIR/$c"
@@ -347,8 +349,8 @@ install_localbin_shims() {
       continue
     fi
 
-    if [[ -e "$target" && ! -L "$target" ]]; then
-      echo "safeexec: WARNING: $target exists; not overwriting. (coverage may be reduced)"
+    if [[ -e "$target" ]] && [[ ! -L "$target" ]]; then
+      echo "safeexec: WARNING: $target exists; not overwriting."
       continue
     fi
 
@@ -372,46 +374,103 @@ remove_localbin_shims() {
   done
 }
 
-install_user_hooks() {
-  local u="$1"
-  local home="$2"
-  local g="$3"
-  [[ -n "$u" && -n "$home" ]] || return 0
+install_homebrew_git_shim() {
+  is_darwin || return 0
 
-  local path_block
-  path_block="$(cat <<EOF
-SAFEEXEC_DIR="$SAFEEXEC_DIR"
-if [ -d "\$SAFEEXEC_DIR" ]; then
-  case ":\$PATH:" in
-    *":\$SAFEEXEC_DIR:"*) ;;
-    *) PATH="\$SAFEEXEC_DIR:\$PATH" ;;
-  esac
-fi
-export PATH
+  local brew_git="/opt/homebrew/bin/git"
+  local brew_real="/opt/homebrew/bin/git.safeexec.real"
+
+  [[ -x "$brew_git" ]] || return 0
+
+  # Already shimmed
+  [[ -e "$brew_real" ]] && return 0
+
+  # Refuse if git is a symlink (brew sometimes uses real file; but be safe)
+  if [[ -L "$brew_git" ]]; then
+    echo "safeexec: WARNING: $brew_git is a symlink; not installing Homebrew shim."
+    return 0
+  fi
+
+  mv "$brew_git" "$brew_real"
+
+  cat >"$brew_git" <<EOF
+#!/usr/bin/env bash
+# SAFEEXEC HOMEBREW GIT SHIM
+exec "$SAFEEXEC_DIR/git" "\$@"
 EOF
-)"
+  chmod 0755 "$brew_git"
 
-  # Put at end of user rc files so it survives PATH changes from brew init, etc.
-  printf '%s\n' "$path_block" | ensure_block_in_user_file "$home/.zshrc"       "$MARK_BEGIN" "$MARK_END" "$u" "$g"
-  printf '%s\n' "$path_block" | ensure_block_in_user_file "$home/.zprofile"    "$MARK_BEGIN" "$MARK_END" "$u" "$g"
-  printf '%s\n' "$path_block" | ensure_block_in_user_file "$home/.bashrc"      "$MARK_BEGIN" "$MARK_END" "$u" "$g"
-  printf '%s\n' "$path_block" | ensure_block_in_user_file "$home/.bash_profile" "$MARK_BEGIN" "$MARK_END" "$u" "$g"
-  printf '%s\n' "$path_block" | ensure_block_in_user_file "$home/.profile"     "$MARK_BEGIN" "$MARK_END" "$u" "$g"
+  echo "safeexec: installed Homebrew git shim at $brew_git (backup: $brew_real)"
 }
 
-remove_user_hooks() {
-  local u="$1"
-  local home="$2"
-  [[ -n "$u" && -n "$home" ]] || return 0
+remove_homebrew_git_shim() {
+  is_darwin || return 0
 
-  remove_block_from_file "$home/.zshrc"        "$MARK_BEGIN" "$MARK_END"
-  remove_block_from_file "$home/.zprofile"     "$MARK_BEGIN" "$MARK_END"
-  remove_block_from_file "$home/.bashrc"       "$MARK_BEGIN" "$MARK_END"
-  remove_block_from_file "$home/.bash_profile" "$MARK_BEGIN" "$MARK_END"
-  remove_block_from_file "$home/.profile"      "$MARK_BEGIN" "$MARK_END"
+  local brew_git="/opt/homebrew/bin/git"
+  local brew_real="/opt/homebrew/bin/git.safeexec.real"
+
+  [[ -e "$brew_real" ]] || return 0
+
+  # Remove shim only if it looks like ours
+  if [[ -f "$brew_git" ]] && grep -q "SAFEEXEC HOMEBREW GIT SHIM" "$brew_git" 2>/dev/null; then
+    rm -f "$brew_git"
+    mv "$brew_real" "$brew_git"
+    echo "safeexec: restored Homebrew git ($brew_git)"
+  else
+    echo "safeexec: WARNING: $brew_real exists but $brew_git does not look like safeexec shim; not restoring."
+  fi
 }
 
-# --- SYSTEM HOOKS ---
+# =============================================================================
+# safeexec CLI: safeexec -on|-off|status
+# =============================================================================
+
+install_safeexec_cli() {
+  ensure_dir "$LOCALBIN"
+  local dst="$LOCALBIN/safeexec"
+  cat >"$dst" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/safeexec"
+STATE_FILE="$STATE_DIR/disabled"
+
+cmd="${1:-status}"
+
+case "$cmd" in
+  -on|on|enable)
+    rm -f "$STATE_FILE" 2>/dev/null || true
+    echo "safeexec: ON"
+    ;;
+  -off|off|disable)
+    mkdir -p "$STATE_DIR"
+    : >"$STATE_FILE"
+    echo "safeexec: OFF"
+    ;;
+  status|st)
+    if [[ -f "$STATE_FILE" ]]; then
+      echo "safeexec: OFF"
+    else
+      echo "safeexec: ON"
+    fi
+    ;;
+  *)
+    echo "Usage: safeexec -on|-off|status" >&2
+    exit 2
+    ;;
+esac
+EOF
+  chmod 0755 "$dst"
+}
+
+remove_safeexec_cli() {
+  rm -f "$LOCALBIN/safeexec" || true
+}
+
+# =============================================================================
+# HOOKS (best-effort)
+# =============================================================================
+
 install_hooks() {
   local path_block
   path_block="$(cat <<EOF
@@ -426,42 +485,45 @@ export PATH
 EOF
 )"
 
-  # 1) /etc/profile.d
-  local profiled_dir
-  profiled_dir="$(dirname "$PROFILED")"
-  if [[ ! -d "$profiled_dir" ]]; then
-    install -d -m 0755 "$profiled_dir" 2>/dev/null || true
-  fi
-  if [[ -d "$profiled_dir" ]]; then
+  # system files (best-effort)
+  ensure_dir "$(dirname "$PROFILED")" || true
+  if [[ -d "$(dirname "$PROFILED")" ]] && [[ -w "$(dirname "$PROFILED")" ]]; then
     cat >"$PROFILED" <<EOF
 # safeexec PATH hook (profile.d)
 $path_block
 EOF
-    chmod 0644 "$PROFILED"
+    chmod 0644 "$PROFILED" 2>/dev/null || true
   fi
 
-  # 2) zsh system files
   printf '%s\n' "$path_block" | ensure_block_in_file "$ZPROFILE" "$MARK_BEGIN" "$MARK_END"
   printf '%s\n' "$path_block" | ensure_block_in_file "$ZSHRC"    "$MARK_BEGIN" "$MARK_END"
-
-  # 3) bash login shells
   printf '%s\n' "$path_block" | ensure_block_in_file "$ETC_PROFILE" "$MARK_BEGIN" "$MARK_END"
 
-  # 4) bash system bashrc (linux)
   local bashrc
   bashrc="$(pick_system_bashrc)"
   if [[ -n "$bashrc" ]]; then
     printf '%s\n' "$path_block" | ensure_block_in_file "$bashrc" "$MARK_BEGIN" "$MARK_END"
   fi
 
-  # 5) sudo secure_path
+  # user files (critical on macOS because brew often rewrites PATH)
+  local u h
+  u="$(target_user)"
+  h="$(user_home "$u")"
+  if [[ -n "$h" ]]; then
+    for f in "$h/.zshrc" "$h/.zprofile" "$h/.bashrc" "$h/.bash_profile" "$h/.profile"; do
+      remove_block_from_file "$f" "$MARK_BEGIN" "$MARK_END" || true
+      printf '%s\n' "$path_block" | ensure_block_in_file "$f" "$MARK_BEGIN" "$MARK_END"
+      chown "$u" "$f" 2>/dev/null || true
+    done
+  fi
+
+  # sudo secure_path
   if [[ -d /etc/sudoers.d ]]; then
     local tmp_sudo
     tmp_sudo="$(mktemp)"
     cat >"$tmp_sudo" <<EOF
 Defaults secure_path="$SAFEEXEC_DIR:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 EOF
-
     if command -v visudo >/dev/null 2>&1; then
       if visudo -cf "$tmp_sudo"; then
         mv "$tmp_sudo" "$SUDOERS_FILE"
@@ -472,33 +534,9 @@ EOF
         rm -f "$tmp_sudo"
       fi
     else
-      if [[ -e /dev/tty ]]; then
-        local reply=""
-        printf '\n[SAFEEXEC] visudo not found. Installing sudoers without validation is risky.\nType "confirm" to proceed: ' > /dev/tty
-        IFS= read -r reply < /dev/tty || true
-        printf '\n' > /dev/tty
-        if [[ "$reply" == "confirm" ]]; then
-          mv "$tmp_sudo" "$SUDOERS_FILE"
-          chmod 440 "$SUDOERS_FILE"
-          echo "safeexec: sudo secure_path installed (unvalidated)."
-        else
-          echo "safeexec: sudo protection NOT installed."
-          rm -f "$tmp_sudo"
-        fi
-      else
-        echo "safeexec: WARNING: visudo missing and no tty; sudo protection NOT installed."
-        rm -f "$tmp_sudo"
-      fi
+      echo "safeexec: WARNING: visudo missing; sudo protection NOT installed."
+      rm -f "$tmp_sudo"
     fi
-  fi
-
-  # 6) user hooks (so it survives user PATH rewrites and works on macOS)
-  local tu th tg
-  tu="$(get_target_user)"
-  th="$(get_user_home "$tu")"
-  tg="$(get_user_group "$tu")"
-  if [[ -n "$tu" && -n "$th" ]]; then
-    install_user_hooks "$tu" "$th" "$tg"
   fi
 }
 
@@ -506,8 +544,8 @@ remove_hooks() {
   rm -f "$PROFILED" || true
   rm -f "$SUDOERS_FILE" || true
 
-  remove_block_from_file "$ZPROFILE"    "$MARK_BEGIN" "$MARK_END"
-  remove_block_from_file "$ZSHRC"       "$MARK_BEGIN" "$MARK_END"
+  remove_block_from_file "$ZPROFILE" "$MARK_BEGIN" "$MARK_END"
+  remove_block_from_file "$ZSHRC" "$MARK_BEGIN" "$MARK_END"
   remove_block_from_file "$ETC_PROFILE" "$MARK_BEGIN" "$MARK_END"
 
   local bashrc
@@ -516,30 +554,63 @@ remove_hooks() {
     remove_block_from_file "$bashrc" "$MARK_BEGIN" "$MARK_END"
   fi
 
-  local tu th
-  tu="$(get_target_user)"
-  th="$(get_user_home "$tu")"
-  if [[ -n "$tu" && -n "$th" ]]; then
-    remove_user_hooks "$tu" "$th"
+  local u h
+  u="$(target_user)"
+  h="$(user_home "$u")"
+  if [[ -n "$h" ]]; then
+    for f in "$h/.zshrc" "$h/.zprofile" "$h/.bashrc" "$h/.bash_profile" "$h/.profile"; do
+      remove_block_from_file "$f" "$MARK_BEGIN" "$MARK_END"
+    done
   fi
 }
 
-# --- MAIN COMMANDS ---
+# =============================================================================
+# ON/OFF TOGGLE (per-user; no sudo required)
+# =============================================================================
+
+cmd_on() {
+  "${LOCALBIN}/safeexec" -on 2>/dev/null || safeexec -on 2>/dev/null || {
+    # fallback if CLI not installed yet
+    local d="${XDG_CONFIG_HOME:-$HOME/.config}/safeexec"
+    mkdir -p "$d"
+    rm -f "$d/disabled"
+    echo "safeexec: ON"
+  }
+}
+
+cmd_off() {
+  "${LOCALBIN}/safeexec" -off 2>/dev/null || safeexec -off 2>/dev/null || {
+    local d="${XDG_CONFIG_HOME:-$HOME/.config}/safeexec"
+    mkdir -p "$d"
+    : >"$d/disabled"
+    echo "safeexec: OFF"
+  }
+}
+
+# =============================================================================
+# MAIN COMMANDS
+# =============================================================================
+
 cmd_install() {
   need_root
   write_wrapper_rm
   write_wrapper_git
   install_localbin_shims
+  install_safeexec_cli
   install_hooks
+  install_homebrew_git_shim
+
   echo "safeexec: installed wrappers in $SAFEEXEC_DIR"
   echo "safeexec: shims installed (or attempted) in $LOCALBIN"
-  echo "safeexec: to enable in CURRENT shell:"
-  echo "  source ~/.zshrc 2>/dev/null || true; source ~/.bashrc 2>/dev/null || true; hash -r"
+  echo "safeexec: toggle with: safeexec -on | safeexec -off"
+  echo "safeexec: for current shell: hash -r; exec \$SHELL -l"
 }
 
 cmd_uninstall() {
   need_root
+  remove_homebrew_git_shim
   remove_localbin_shims
+  remove_safeexec_cli
   remove_hooks
   rm -f "$SAFEEXEC_DIR/rm" "$SAFEEXEC_DIR/git" || true
   rmdir "$SAFEEXEC_DIR" 2>/dev/null || true
@@ -567,19 +638,26 @@ cmd_status() {
   done
 
   echo -n "PATH includes SAFEEXEC_DIR: "
-  if [[ ":${PATH:-}:" == *":$SAFEEXEC_DIR:"* ]]; then
-    echo "[YES]"
-  else
-    echo "[NO]"
-  fi
+  if [[ ":${PATH:-}:" == *":$SAFEEXEC_DIR:"* ]]; then echo "[YES]"; else echo "[NO]"; fi
 
   echo "which rm:  ${rm_path:-n/a}"
   echo "which git: ${git_path:-n/a}"
 
   echo -n "effective gate rm:  "
   if [[ "$rm_path" == "$SAFEEXEC_DIR/rm" || "$rm_path" == "$LOCALBIN/rm" ]]; then echo "[YES]"; else echo "[NO]"; fi
+
   echo -n "effective gate git: "
-  if [[ "$git_path" == "$SAFEEXEC_DIR/git" || "$git_path" == "$LOCALBIN/git" ]]; then echo "[YES]"; else echo "[NO]"; fi
+  if [[ "$git_path" == "$SAFEEXEC_DIR/git" || "$git_path" == "$LOCALBIN/git" ]]; then
+    echo "[YES]"
+  elif [[ "$git_path" == "/opt/homebrew/bin/git" ]] && [[ -f "/opt/homebrew/bin/git.safeexec.real" ]] && grep -q "SAFEEXEC HOMEBREW GIT SHIM" /opt/homebrew/bin/git 2>/dev/null; then
+    echo "[YES] (homebrew shim)"
+  else
+    echo "[NO]"
+  fi
+
+  if command -v safeexec >/dev/null 2>&1; then
+    safeexec status || true
+  fi
 }
 
 main() {
@@ -588,6 +666,8 @@ main() {
     install) cmd_install ;;
     uninstall) cmd_uninstall ;;
     status) cmd_status ;;
+    on) cmd_on ;;
+    off) cmd_off ;;
     *) usage ;;
   esac
 }
