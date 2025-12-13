@@ -240,8 +240,19 @@ remove_localbin_shims() {
 
 # --- SYSTEM HOOKS ---
 install_hooks() {
-  # 1) /etc/profile.d
-  cat >"$PROFILED" <<EOF
+
+  # 1) /etc/profile.d (Global PATH hook)
+  local profiled_dir
+  profiled_dir="$(dirname "$PROFILED")"
+
+  if [[ ! -d "$profiled_dir" ]]; then
+    if ! install -d -m 0755 "$profiled_dir" 2>/dev/null; then
+      echo "safeexec: WARNING: cannot create $profiled_dir; skipping global PATH hook."
+    fi
+  fi
+
+  if [[ -d "$profiled_dir" ]]; then
+    cat >"$PROFILED" <<EOF
 # safeexec PATH hook
 SAFEEXEC_DIR="$SAFEEXEC_DIR"
 if [ -d "\$SAFEEXEC_DIR" ]; then
@@ -252,7 +263,8 @@ if [ -d "\$SAFEEXEC_DIR" ]; then
 fi
 export PATH
 EOF
-  chmod 0644 "$PROFILED"
+    chmod 0644 "$PROFILED"
+  fi
 
   # 2) sudo secure_path
   if [[ -d /etc/sudoers.d ]]; then
