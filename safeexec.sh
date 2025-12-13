@@ -3,13 +3,21 @@ set -euo pipefail
 
 # =============================================================================
 # SAFEEXEC: Destructive Command Interceptor
-# Prevents accidental execution of rm/git commands by requiring user confirmation.
+# Gates: rm -rf, and git reset/revert/checkout/restore (+ some extras)
+# Cross-platform hooks: Linux (/etc/profile.d, bashrc), macOS (zprofile/zshrc/profile)
 # =============================================================================
 
 SAFEEXEC_DIR="/usr/local/safeexec/bin"
 LOCALBIN="/usr/local/bin"
-PROFILED="/etc/profile.d/safeexec.sh"
-SUDOERS_FILE="/etc/sudoers.d/safeexec"
+
+PROFILED="/etc/profile.d/safeexec.sh"     # Linux-style
+SUDOERS_FILE="/etc/sudoers.d/safeexec"    # Linux/mac if included by sudoers
+
+# macOS common system shell files (also exist on many Linux boxes harmlessly)
+ZPROFILE="/etc/zprofile"
+ZSHRC="/etc/zshrc"
+ETC_PROFILE="/etc/profile"
+
 MARK_BEGIN="# SAFEEXEC BEGIN"
 MARK_END="# SAFEEXEC END"
 
@@ -19,9 +27,9 @@ need_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "Run as root"; }
 usage() {
   cat >&2 <<'EOF'
 Usage:
-  safeexec.sh install    # Installs wrappers and hooks
-  safeexec.sh uninstall  # Removes all traces
-  safeexec.sh status     # Checks installation health
+  safeexec.sh install
+  safeexec.sh uninstall
+  safeexec.sh status
 EOF
   exit 2
 }
@@ -32,9 +40,58 @@ pick_system_bashrc() {
   else echo ""; fi
 }
 
+ensure_dir() {
+  local d="$1"
+  [[ -d "$d" ]] || install -d -m 0755 "$d"
+}
+
+ensure_block_in_file() {
+  local file="$1" begin="$2" end="$3"
+  local block; block="$(cat)"
+
+  ensure_dir "$(dirname "$file")"
+  [[ -e "$file" ]] || touch "$file"
+
+  if ! [[ -w "$file" ]]; then
+    echo "safeexec: WARNING: cannot modify $file (not writable); skipping."
+    return 0
+  fi
+
+  if grep -Fq "$begin" "$file" 2>/dev/null; then
+    return 0
+  fi
+
+  {
+    echo ""
+    echo "$begin"
+    echo "$block"
+    echo "$end"
+    echo ""
+  } >>"$file"
+}
+
+remove_block_from_file() {
+  local file="$1" begin="$2" end="$3"
+  [[ -f "$file" && -w "$file" ]] || return 0
+  grep -Fq "$begin" "$file" 2>/dev/null || return 0
+  awk -v b="$begin" -v e="$end" '
+    $0==b {skip=1; next}
+    $0==e {skip=0; next}
+    !skip {print}
+  ' "$file" > "${file}.safeexec.tmp" && mv "${file}.safeexec.tmp" "$file"
+}
+
+symlink_points_to() {
+  local link="$1" target="$2"
+  [[ -L "$link" ]] || return 1
+  local got=""
+  got="$(readlink "$link" 2>/dev/null || true)"
+  [[ "$got" == "$target" ]]
+}
+
 # --- WRAPPER: RM ---
 write_wrapper_rm() {
-  install -d -m 0755 "$SAFEEXEC_DIR"
+  ensure_dir "$SAFEEXEC_DIR"
   local dst="$SAFEEXEC_DIR/rm"
   cat >"$dst" <<'EOF'
 #!/usr/bin/env bash
@@ -90,6 +147,7 @@ for arg in "$@"; do
   esac
 done
 
+# Gate only rm -rf (per requirement)
 if [[ "$force" -eq 1 && "$rec" -eq 1 ]]; then
   cmd_str="$(printf '%q ' "$@")"
   confirm_or_die "$cmd_str"
@@ -102,7 +160,7 @@ EOF
 
 # --- WRAPPER: GIT ---
 write_wrapper_git() {
-  install -d -m 0755 "$SAFEEXEC_DIR"
+  ensure_dir "$SAFEEXEC_DIR"
   local dst="$SAFEEXEC_DIR/git"
   cat >"$dst" <<'EOF'
 #!/usr/bin/env bash
@@ -142,6 +200,7 @@ args=("$@")
 subcmd=""
 subcmd_idx=-1
 
+# Parse global options to find subcommand
 i=0
 while (( i < ${#args[@]} )); do
   a="${args[i]}"
@@ -165,19 +224,23 @@ should_gate=0
 
 if [[ -n "$subcmd" ]]; then
   case "$subcmd" in
+    # Always gate per original requirement
     reset|revert|checkout|restore)
       should_gate=1
       ;;
+    # Gate only when force is present (otherwise usually no deletion occurs)
     clean)
       for arg in "${args[@]}"; do
         if [[ "$arg" == "-f" || "$arg" == "--force" ]]; then should_gate=1; break; fi
       done
       ;;
+    # Gate when forced/discarding changes
     switch)
       for arg in "${args[@]}"; do
         if [[ "$arg" == "-f" || "$arg" == "--force" || "$arg" == "--discard-changes" ]]; then should_gate=1; break; fi
       done
       ;;
+    # Gate destructive stash ops
     stash)
       if (( subcmd_idx + 1 < ${#args[@]} )); then
         stash_op="${args[$((subcmd_idx+1))]}"
@@ -197,29 +260,28 @@ EOF
   chmod 0755 "$dst"
 }
 
-# --- SHIMS INTO /usr/local/bin (Improves coverage) ---
+# --- /usr/local/bin shims (improves coverage on macOS + many Linux setups) ---
 install_localbin_shims() {
-  install -d -m 0755 "$LOCALBIN"
-
+  ensure_dir "$LOCALBIN"
   for c in rm git; do
     local target="$LOCALBIN/$c"
     local src="$SAFEEXEC_DIR/$c"
 
-    if [[ -L "$target" ]]; then
-      local resolved
-      resolved="$(readlink -f "$target" 2>/dev/null || true)"
-      if [[ "$resolved" == "$src" ]]; then
-        continue
-      fi
-      echo "safeexec: WARNING: $target is a symlink not managed by safeexec; leaving it alone."
+    if symlink_points_to "$target" "$src"; then
       continue
     fi
 
-    if [[ -e "$target" ]]; then
+    if [[ -e "$target" && ! -L "$target" ]]; then
       echo "safeexec: WARNING: $target exists; not overwriting. (coverage may be reduced)"
       continue
     fi
 
+    if [[ -L "$target" && ! symlink_points_to "$target" "$src" ]]; then
+      echo "safeexec: WARNING: $target is a symlink not managed by safeexec; leaving it alone."
+      continue
+    fi
+
+    rm -f "$target" 2>/dev/null || true
     ln -s "$src" "$target"
   done
 }
@@ -228,32 +290,17 @@ remove_localbin_shims() {
   for c in rm git; do
     local target="$LOCALBIN/$c"
     local src="$SAFEEXEC_DIR/$c"
-    if [[ -L "$target" ]]; then
-      local resolved
-      resolved="$(readlink -f "$target" 2>/dev/null || true)"
-      if [[ "$resolved" == "$src" ]]; then
-        rm -f "$target"
-      fi
+    if symlink_points_to "$target" "$src"; then
+      rm -f "$target"
     fi
   done
 }
 
 # --- SYSTEM HOOKS ---
 install_hooks() {
-
-  # 1) /etc/profile.d (Global PATH hook)
-  local profiled_dir
-  profiled_dir="$(dirname "$PROFILED")"
-
-  if [[ ! -d "$profiled_dir" ]]; then
-    if ! install -d -m 0755 "$profiled_dir" 2>/dev/null; then
-      echo "safeexec: WARNING: cannot create $profiled_dir; skipping global PATH hook."
-    fi
-  fi
-
-  if [[ -d "$profiled_dir" ]]; then
-    cat >"$PROFILED" <<EOF
-# safeexec PATH hook
+  # Common PATH block (for zprofile/zshrc/profile/bashrc)
+  local path_block
+  path_block="$(cat <<EOF
 SAFEEXEC_DIR="$SAFEEXEC_DIR"
 if [ -d "\$SAFEEXEC_DIR" ]; then
   case ":\$PATH:" in
@@ -263,10 +310,36 @@ if [ -d "\$SAFEEXEC_DIR" ]; then
 fi
 export PATH
 EOF
+)"
+
+  # 1) Linux-style: /etc/profile.d (create dir if missing)
+  local profiled_dir
+  profiled_dir="$(dirname "$PROFILED")"
+  if [[ -d "$profiled_dir" || ( ! -e "$profiled_dir" && install -d -m 0755 "$profiled_dir" 2>/dev/null ) ]]; then
+    cat >"$PROFILED" <<EOF
+# safeexec PATH hook (profile.d)
+$path_block
+EOF
     chmod 0644 "$PROFILED"
+  else
+    echo "safeexec: WARNING: cannot create $profiled_dir; skipping $PROFILED."
   fi
 
-  # 2) sudo secure_path
+  # 2) macOS: ensure zsh gets it (Terminal often uses zsh)
+  printf '%s\n' "$path_block" | ensure_block_in_file "$ZPROFILE" "$MARK_BEGIN" "$MARK_END"
+  printf '%s\n' "$path_block" | ensure_block_in_file "$ZSHRC"   "$MARK_BEGIN" "$MARK_END"
+
+  # 3) bash login shells (both Linux/macOS may use /etc/profile)
+  printf '%s\n' "$path_block" | ensure_block_in_file "$ETC_PROFILE" "$MARK_BEGIN" "$MARK_END"
+
+  # 4) bash interactive non-login shells (Linux)
+  local bashrc
+  bashrc="$(pick_system_bashrc)"
+  if [[ -n "$bashrc" ]]; then
+    printf '%s\n' "$path_block" | ensure_block_in_file "$bashrc" "$MARK_BEGIN" "$MARK_END"
+  fi
+
+  # 5) sudo secure_path (optional; validated if possible)
   if [[ -d /etc/sudoers.d ]]; then
     local tmp_sudo
     tmp_sudo="$(mktemp)"
@@ -284,7 +357,6 @@ EOF
         rm -f "$tmp_sudo"
       fi
     else
-      # Fallback: manual confirm for minimal systems
       if [[ -e /dev/tty ]]; then
         local reply=""
         printf '\n[SAFEEXEC] visudo not found. Installing sudoers without validation is risky.\nType "confirm" to proceed: ' > /dev/tty
@@ -304,28 +376,7 @@ EOF
       fi
     fi
   else
-    echo "safeexec: WARNING: /etc/sudoers.d not found. 'sudo rm' might bypass the wrapper."
-  fi
-
-  # 3) bashrc (interactive non-login)
-  local bashrc
-  bashrc="$(pick_system_bashrc)"
-  if [[ -n "$bashrc" && -f "$bashrc" && -w "$bashrc" ]]; then
-    if ! grep -Fq "$MARK_BEGIN" "$bashrc" 2>/dev/null; then
-      cat >>"$bashrc" <<EOF
-
-$MARK_BEGIN
-SAFEEXEC_DIR="$SAFEEXEC_DIR"
-if [ -d "\$SAFEEXEC_DIR" ]; then
-  case ":\$PATH:" in
-    *":\$SAFEEXEC_DIR:"*) ;;
-    *) PATH="\$SAFEEXEC_DIR:\$PATH" ;;
-  esac
-fi
-export PATH
-$MARK_END
-EOF
-    fi
+    echo "safeexec: WARNING: /etc/sudoers.d not found; sudo protection NOT installed."
   fi
 }
 
@@ -333,20 +384,18 @@ remove_hooks() {
   rm -f "$PROFILED" || true
   rm -f "$SUDOERS_FILE" || true
 
+  remove_block_from_file "$ZPROFILE"     "$MARK_BEGIN" "$MARK_END"
+  remove_block_from_file "$ZSHRC"        "$MARK_BEGIN" "$MARK_END"
+  remove_block_from_file "$ETC_PROFILE"  "$MARK_BEGIN" "$MARK_END"
+
   local bashrc
   bashrc="$(pick_system_bashrc)"
-  if [[ -n "$bashrc" && -f "$bashrc" && -w "$bashrc" ]]; then
-    if grep -Fq "$MARK_BEGIN" "$bashrc" 2>/dev/null; then
-      awk -v b="$MARK_BEGIN" -v e="$MARK_END" '
-        $0==b {skip=1; next}
-        $0==e {skip=0; next}
-        !skip {print}
-      ' "$bashrc" > "${bashrc}.safeexec.tmp" && mv "${bashrc}.safeexec.tmp" "$bashrc"
-    fi
+  if [[ -n "$bashrc" ]]; then
+    remove_block_from_file "$bashrc" "$MARK_BEGIN" "$MARK_END"
   fi
 }
 
-# --- MAIN ---
+# --- MAIN COMMANDS ---
 cmd_install() {
   need_root
   write_wrapper_rm
@@ -354,8 +403,8 @@ cmd_install() {
   install_localbin_shims
   install_hooks
   echo "safeexec: installed wrappers in $SAFEEXEC_DIR"
-  echo "safeexec: shims attempted in $LOCALBIN"
-  echo 'safeexec: start a new shell to test.'
+  echo "safeexec: shims installed (or attempted) in $LOCALBIN"
+  echo "safeexec: start a new shell (or run: hash -r) to ensure command cache refresh."
 }
 
 cmd_uninstall() {
@@ -376,7 +425,7 @@ cmd_status() {
 
   for c in rm git; do
     t="$LOCALBIN/$c"
-    if [[ -L "$t" ]] && [[ "$(readlink -f "$t" 2>/dev/null || true)" == "$SAFEEXEC_DIR/$c" ]]; then
+    if symlink_points_to "$t" "$SAFEEXEC_DIR/$c"; then
       echo "$LOCALBIN/$c shim: [OK]"
     else
       echo "$LOCALBIN/$c shim: [NO]"
@@ -384,11 +433,14 @@ cmd_status() {
   done
 
   echo -n "PATH includes SAFEEXEC_DIR: "
-  if [[ ":$PATH:" == *":$SAFEEXEC_DIR:"* ]]; then
+  if [[ ":${PATH:-}:" == *":$SAFEEXEC_DIR:"* ]]; then
     echo "[YES]"
   else
     echo "[NO]"
   fi
+
+  echo "which rm: $(command -v rm 2>/dev/null || echo 'n/a')"
+  echo "which git: $(command -v git 2>/dev/null || echo 'n/a')"
 }
 
 main() {
