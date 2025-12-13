@@ -1,6 +1,6 @@
 # SafeExec: Destructive Command Interceptor
 
-**SafeExec** is a Bash-based safety layer designed to protect VPS servers from accidental or hallucinated destructive commands run by AI agents (like Codex/GPT) or human operators.
+**SafeExec** is a Bash-based safety layer designed to protect debian servers or Mac OSX from accidental or hallucinated destructive commands run by AI agents (like Codex/GPT) or human operators.
 
 It intercepts dangerous commands (like `rm -rf` or `git reset --hard`) and enforces an interactive **confirmation gate** via `/dev/tty`. This prevents automated scripts or piped commands from bypassing safety checks.
 
