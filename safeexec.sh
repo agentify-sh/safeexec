@@ -10,10 +10,9 @@ set -euo pipefail
 SAFEEXEC_DIR="/usr/local/safeexec/bin"
 LOCALBIN="/usr/local/bin"
 
-PROFILED="/etc/profile.d/safeexec.sh"     # Linux-style
-SUDOERS_FILE="/etc/sudoers.d/safeexec"    # Linux/mac if included by sudoers
+PROFILED="/etc/profile.d/safeexec.sh"
+SUDOERS_FILE="/etc/sudoers.d/safeexec"
 
-# macOS common system shell files (also exist on many Linux boxes harmlessly)
 ZPROFILE="/etc/zprofile"
 ZSHRC="/etc/zshrc"
 ETC_PROFILE="/etc/profile"
@@ -22,7 +21,7 @@ MARK_BEGIN="# SAFEEXEC BEGIN"
 MARK_END="# SAFEEXEC END"
 
 die() { echo "safeexec: $*" >&2; exit 1; }
-need_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "Run as root"; }
+need_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "Run as root (sudo)"; }
 
 usage() {
   cat >&2 <<'EOF'
@@ -114,8 +113,7 @@ confirm_or_die() {
 
   local reply=""
   printf '\n\033[0;31m[SAFEEXEC] DESTRUCTIVE COMMAND INTERCEPTED:\033[0m\n  rm %s\n' "$cmd" > /dev/tty
-  printf 'Type "confirm" to execute: ' > /dev/tty
-
+  printf 'STOP! Get permission from a human! type "confirm" to execute: ' > /dev/tty
   IFS= read -r reply < /dev/tty || true
   printf '\n' > /dev/tty
 
@@ -123,6 +121,7 @@ confirm_or_die() {
     echo "safeexec: cancelled" >&2
     exit 130
   fi
+
   log_audit "CONFIRMED: rm $cmd"
 }
 
@@ -147,7 +146,7 @@ for arg in "$@"; do
   esac
 done
 
-# Gate only rm -rf (per requirement)
+# Gate only rm -rf
 if [[ "$force" -eq 1 && "$rec" -eq 1 ]]; then
   cmd_str="$(printf '%q ' "$@")"
   confirm_or_die "$cmd_str"
@@ -191,6 +190,7 @@ confirm_or_die() {
     echo "safeexec: cancelled" >&2
     exit 130
   fi
+
   log_audit "CONFIRMED: git $cmd"
 }
 
@@ -224,23 +224,19 @@ should_gate=0
 
 if [[ -n "$subcmd" ]]; then
   case "$subcmd" in
-    # Always gate per original requirement
     reset|revert|checkout|restore)
       should_gate=1
       ;;
-    # Gate only when force is present (otherwise usually no deletion occurs)
     clean)
       for arg in "${args[@]}"; do
         if [[ "$arg" == "-f" || "$arg" == "--force" ]]; then should_gate=1; break; fi
       done
       ;;
-    # Gate when forced/discarding changes
     switch)
       for arg in "${args[@]}"; do
         if [[ "$arg" == "-f" || "$arg" == "--force" || "$arg" == "--discard-changes" ]]; then should_gate=1; break; fi
       done
       ;;
-    # Gate destructive stash ops
     stash)
       if (( subcmd_idx + 1 < ${#args[@]} )); then
         stash_op="${args[$((subcmd_idx+1))]}"
@@ -263,6 +259,7 @@ EOF
 # --- /usr/local/bin shims (improves coverage on macOS + many Linux setups) ---
 install_localbin_shims() {
   ensure_dir "$LOCALBIN"
+
   for c in rm git; do
     local target="$LOCALBIN/$c"
     local src="$SAFEEXEC_DIR/$c"
@@ -276,7 +273,7 @@ install_localbin_shims() {
       continue
     fi
 
-    if [[ -L "$target" && ! symlink_points_to "$target" "$src" ]]; then
+    if [[ -L "$target" ]] && ! symlink_points_to "$target" "$src"; then
       echo "safeexec: WARNING: $target is a symlink not managed by safeexec; leaving it alone."
       continue
     fi
@@ -298,7 +295,6 @@ remove_localbin_shims() {
 
 # --- SYSTEM HOOKS ---
 install_hooks() {
-  # Common PATH block (for zprofile/zshrc/profile/bashrc)
   local path_block
   path_block="$(cat <<EOF
 SAFEEXEC_DIR="$SAFEEXEC_DIR"
@@ -312,24 +308,27 @@ export PATH
 EOF
 )"
 
-  # 1) Linux-style: /etc/profile.d (create dir if missing)
+  # 1) /etc/profile.d (Linux-style)
   local profiled_dir
   profiled_dir="$(dirname "$PROFILED")"
-  if [[ -d "$profiled_dir" || ( ! -e "$profiled_dir" && install -d -m 0755 "$profiled_dir" 2>/dev/null ) ]]; then
+  if [[ ! -d "$profiled_dir" ]]; then
+    if ! install -d -m 0755 "$profiled_dir" 2>/dev/null; then
+      echo "safeexec: WARNING: cannot create $profiled_dir; skipping $PROFILED."
+    fi
+  fi
+  if [[ -d "$profiled_dir" ]]; then
     cat >"$PROFILED" <<EOF
 # safeexec PATH hook (profile.d)
 $path_block
 EOF
     chmod 0644 "$PROFILED"
-  else
-    echo "safeexec: WARNING: cannot create $profiled_dir; skipping $PROFILED."
   fi
 
-  # 2) macOS: ensure zsh gets it (Terminal often uses zsh)
+  # 2) macOS zsh (and harmless on Linux)
   printf '%s\n' "$path_block" | ensure_block_in_file "$ZPROFILE" "$MARK_BEGIN" "$MARK_END"
   printf '%s\n' "$path_block" | ensure_block_in_file "$ZSHRC"   "$MARK_BEGIN" "$MARK_END"
 
-  # 3) bash login shells (both Linux/macOS may use /etc/profile)
+  # 3) bash login shells
   printf '%s\n' "$path_block" | ensure_block_in_file "$ETC_PROFILE" "$MARK_BEGIN" "$MARK_END"
 
   # 4) bash interactive non-login shells (Linux)
@@ -384,9 +383,9 @@ remove_hooks() {
   rm -f "$PROFILED" || true
   rm -f "$SUDOERS_FILE" || true
 
-  remove_block_from_file "$ZPROFILE"     "$MARK_BEGIN" "$MARK_END"
-  remove_block_from_file "$ZSHRC"        "$MARK_BEGIN" "$MARK_END"
-  remove_block_from_file "$ETC_PROFILE"  "$MARK_BEGIN" "$MARK_END"
+  remove_block_from_file "$ZPROFILE"    "$MARK_BEGIN" "$MARK_END"
+  remove_block_from_file "$ZSHRC"       "$MARK_BEGIN" "$MARK_END"
+  remove_block_from_file "$ETC_PROFILE" "$MARK_BEGIN" "$MARK_END"
 
   local bashrc
   bashrc="$(pick_system_bashrc)"
@@ -404,7 +403,7 @@ cmd_install() {
   install_hooks
   echo "safeexec: installed wrappers in $SAFEEXEC_DIR"
   echo "safeexec: shims installed (or attempted) in $LOCALBIN"
-  echo "safeexec: start a new shell (or run: hash -r) to ensure command cache refresh."
+  echo "safeexec: run: hash -r   (then test rm -rf /tmp/safeexec-test)"
 }
 
 cmd_uninstall() {
