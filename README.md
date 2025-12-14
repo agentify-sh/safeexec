@@ -1,54 +1,63 @@
-# SafeExec: Destructive Command Interceptor
+# SafeExec: Destructive Command Interceptor (Ubuntu + macOS)
 
-**SafeExec** is a Bash-based safety layer designed to protect Debian/Linux servers and macOS from accidental (or hallucinated) destructive commands run by AI agents (Codex/GPT) or humans.
+**SafeExec** is a Bash-based safety layer that protects **Ubuntu servers** and **macOS** from accidental (or hallucinated) destructive commands run by AI agents (Codex/GPT) or humans.
 
-It intercepts dangerous commands (like `rm -rf` or `git reset --hard`) and enforces an interactive **confirmation gate** via `/dev/tty`. This prevents automated scripts, pipes, and non-TTY execution from bypassing safety checks.
+It intercepts dangerous commands (like `rm -rf` or `git reset --hard`) and enforces an interactive **confirmation gate** via `/dev/tty`. This prevents pipes/non-interactive execution from bypassing safety checks.
 
 ---
 
 ## 🛡️ Features
 
 - **TTY-Based Confirmation Gate**
-  - Requires the user to manually type `confirm` to proceed.
-  - Reads directly from `/dev/tty`, so `echo confirm | rm -rf ...` won’t bypass it.
+  - Requires the user to type `confirm` to proceed.
+  - Reads from `/dev/tty` (not stdin), so `echo confirm | ...` doesn’t bypass it.
   - If there is **no TTY**, the command is **blocked** (exit `126`).
 
 - **Destructive `rm` Gating**
-  - Intercepts `rm` only when **both** recursive and force flags are present:
-    - `rm -rf ...`, `rm -fr ...`, `rm --recursive --force ...`, etc.
+  - Intercepts only when both recursive + force flags are present:
+    - `rm -rf ...`, `rm -fr ...`, `rm --recursive --force ...`
 
 - **Granular `git` Gating**
   - **Always gated:** `git reset`, `git revert`, `git checkout`, `git restore`
-  - **Gated if forced:** `git clean -f`, `git clean --force`
+  - **Gated if forced:** `git clean -f` / `git clean --force`
   - **Gated if destructive:** `git switch -f`, `git switch --discard-changes`
   - **Gated stash ops:** `git stash drop`, `git stash clear`, `git stash pop`
 
-- **Sudo Protection (Linux + macOS)**
-  - Installs `/etc/sudoers.d/safeexec` to prepend SafeExec to `secure_path`,
-    ensuring `sudo rm -rf ...` and `sudo git ...` hit the wrappers.
+- **Sudo Protection**
+  - Installs `/etc/sudoers.d/safeexec` to prepend SafeExec into `secure_path`,
+    ensuring `sudo rm -rf ...` and `sudo git ...` are intercepted.
 
 - **macOS Homebrew Git Coverage**
-  - Homebrew’s `git` typically resolves from `/opt/homebrew/bin/git` (often ahead of `/usr/local/bin`).
+  - On Apple Silicon, `git` typically resolves from `/opt/homebrew/bin/git` (often ahead of `/usr/local/bin`).
   - SafeExec installs a **Homebrew git shim** at `/opt/homebrew/bin/git`, backing up the original to:
     - `/opt/homebrew/bin/git.safeexec.real`
-  - This makes `git` gating work even when PATH ordering would otherwise bypass it.
 
-- **Quick Toggle (On/Off)**
-  - `safeexec -off` disables prompting **per-user**
-  - `safeexec -on` re-enables it
-  - `safeexec status` shows current state
+- **Ubuntu Hard Mode (Codex Harness Safe)**
+  - Codex/non-interactive harnesses can bypass aliases and even PATH via:
+    - `command -p`, absolute paths (`/usr/bin/rm`), or restricted environment PATH.
+  - SafeExec supports **hard mode** on Ubuntu via `dpkg-divert`:
+    - diverts the real binaries to `*.safeexec.real`
+    - installs tiny wrappers at `/usr/bin/rm` and `/usr/bin/git` that always route through SafeExec
+  - This catches **non-interactive shells, command -p, and absolute paths**.
+
+- **Quick Toggle**
+  - `safeexec -off` disables prompts **per-user**
+  - `safeexec -on` re-enables
+  - `safeexec status` prints current state
+  - Global toggle is supported:
+    - `sudo safeexec -off --global`
 
 - **Audit Logging**
   - Logs blocked + confirmed actions to syslog via `logger` (if available).
 
 - **Fail-Safe Install**
-  - Uses `visudo -c` to validate the sudoers snippet before installing (if `visudo` exists).
+  - Validates sudoers changes using `visudo -c` before installing (if `visudo` exists).
 
 ---
 
 ## 🚀 Installation
 
-You must run the install step as **root**.
+### macOS
 
 ```bash
 chmod +x safeexec.sh
@@ -56,17 +65,31 @@ sudo ./safeexec.sh install
 hash -r
 ```
 
-Notes:
-- You do **not** need `SAFEEXEC_DIR` in `$PATH` on macOS. Shims take precedence.
-- After install, open a new terminal (or run `hash -r`) to refresh command lookup.
+### Ubuntu (Soft Mode)
+
+```bash
+chmod +x safeexec.sh
+sudo ./safeexec.sh install
+hash -r
+```
+
+### Ubuntu (Hard Mode — recommended for Codex/agents)
+
+Hard mode is what makes SafeExec apply to **non-interactive harness execution** and cases where PATH is bypassed.
+
+```bash
+sudo ./safeexec.sh install
+sudo ./safeexec.sh install-hard
+```
 
 ---
 
 ## 📖 Usage
 
-Once installed, usage is seamless. If a dangerous command is attempted, execution pauses:
+If a dangerous command is attempted, execution is paused:
 
-### Example: Deleting a directory
+### Example: `rm -rf`
+
 ```bash
 rm -rf /var/www/html
 
@@ -75,7 +98,8 @@ rm -rf /var/www/html
 Type "confirm" to execute:
 ```
 
-### Example: Git reset
+### Example: `git reset --hard`
+
 ```bash
 git reset --hard HEAD~1
 
@@ -84,56 +108,68 @@ git reset --hard HEAD~1
 Type "confirm" to execute:
 ```
 
-- Type `confirm` + Enter to proceed.
-- Any other input (or `Ctrl+C`) aborts with exit code `130`.
+To proceed, type `confirm` + Enter. Any other input (or `Ctrl+C`) cancels with exit code `130`.
 
 ---
 
-## 🔀 Toggle On/Off (recommended)
+## 🔀 Toggle On/Off
 
-Disable prompts temporarily (per-user):
+Per-user:
 
 ```bash
 safeexec -off
 safeexec status
+safeexec -on
 ```
 
-Re-enable:
+Global (requires sudo):
 
 ```bash
-safeexec -on
-safeexec status
+sudo safeexec -off --global
+sudo safeexec -on --global
+sudo safeexec status --global
 ```
 
-Accepted forms:
-- `safeexec on|off|status`
-- `safeexec -on|-off|-status`
-- case-insensitive (e.g. `safeexec OFF` works)
+One-command bypass (no prompting for that single invocation):
+
+```bash
+SAFEEXEC_DISABLED=1 rm -rf /tmp/junk
+SAFEEXEC_DISABLED=1 git reset --hard
+```
 
 ---
 
-## ⚙️ How It Works (high-level)
+## ⚙️ How It Works
 
-1. **Wrappers**
-   - Installs wrapper scripts at:
-     - `/usr/local/safeexec/bin/rm`
-     - `/usr/local/safeexec/bin/git`
+### Soft Mode (macOS + Ubuntu)
 
-2. **Shims**
-   - Installs symlink shims in:
-     - `/usr/local/bin/rm` → `/usr/local/safeexec/bin/rm`
-     - `/usr/local/bin/git` → `/usr/local/safeexec/bin/git`
+1. Installs wrappers at:
+   - `/usr/local/safeexec/bin/rm`
+   - `/usr/local/safeexec/bin/git`
+2. Installs shims (symlinks) at:
+   - `/usr/local/bin/rm` → `/usr/local/safeexec/bin/rm`
+   - `/usr/local/bin/git` → `/usr/local/safeexec/bin/git`
+3. Installs sudo `secure_path` rule:
+   - `/etc/sudoers.d/safeexec`
 
-3. **macOS/Homebrew Git Shim**
-   - On Apple Silicon, `git` often resolves to `/opt/homebrew/bin/git`.
-   - SafeExec replaces that with a small shim that calls SafeExec’s wrapper and backs up the original:
-     - backup: `/opt/homebrew/bin/git.safeexec.real`
+### macOS Homebrew Git Shim
 
-4. **Sudo secure_path**
-   - Installs `/etc/sudoers.d/safeexec` so `sudo` prefers SafeExec’s directory.
+Because Homebrew’s PATH often wins, SafeExec also installs:
 
-5. **/dev/tty Confirmation**
-   - Prompts and reads from `/dev/tty` (not stdin), blocking pipes and non-interactive execution.
+- `/opt/homebrew/bin/git` shim → calls SafeExec wrapper
+- Backup stored as:
+  - `/opt/homebrew/bin/git.safeexec.real`
+
+### Ubuntu Hard Mode (dpkg-divert)
+
+1. Diverts real binaries:
+   - `/usr/bin/rm` → `/usr/bin/rm.safeexec.real`
+   - `/usr/bin/git` → `/usr/bin/git.safeexec.real`
+2. Installs wrappers at the original paths (`/usr/bin/rm`, `/usr/bin/git`) that dispatch into:
+   - `/usr/local/safeexec/bin/rm`
+   - `/usr/local/safeexec/bin/git`
+
+Result: even `command -p rm`, absolute paths, and minimal environment shells are gated.
 
 ---
 
@@ -143,43 +179,78 @@ Accepted forms:
 ./safeexec.sh status
 ```
 
-Example output on macOS (common and OK):
+### macOS expected output (PATH may be NO, that’s fine)
+
 ```text
 PATH includes SAFEEXEC_DIR: [NO] (OK if shims win)
 which rm:  /usr/local/bin/rm
 which git: /opt/homebrew/bin/git
 effective gate rm:  [YES]
 effective gate git: [YES] (homebrew shim)
+safeexec: ON
 ```
 
-Important: On macOS, **PATH may not include** `SAFEEXEC_DIR`. What matters is `effective gate ...: [YES]`.
+### Ubuntu hard mode expected output
+
+```text
+rm hard-mode:    [YES] (/usr/bin/rm)
+git hard-mode:   [YES] (/usr/bin/git)
+```
 
 ---
 
-## ⚠️ Emergency Bypass (absolute path)
+## ⚠️ Emergency Bypass
 
-SafeExec relies on PATH/shims. Absolute paths bypass it:
+### Soft mode bypass (absolute paths)
 
 ```bash
 /bin/rm -rf /tmp/junk
 /usr/bin/git reset --hard
-/opt/homebrew/bin/git.safeexec.real reset --hard   # macOS: bypass safeexec shim explicitly
 ```
 
-Use with care.
+### macOS Homebrew bypass
+
+```bash
+/opt/homebrew/bin/git.safeexec.real reset --hard
+```
+
+### Ubuntu hard mode bypass
+
+Hard mode is designed to be hard to bypass. If you must bypass in an emergency:
+
+- Disable globally:
+  ```bash
+  sudo safeexec -off --global
+  ```
+- Or uninstall hard mode:
+  ```bash
+  sudo ./safeexec.sh uninstall-hard
+  ```
 
 ---
 
 ## 🧹 Uninstall
 
+Soft mode uninstall:
+
 ```bash
 sudo ./safeexec.sh uninstall
 ```
 
-This removes:
-- wrappers in `/usr/local/safeexec/bin`
-- shims in `/usr/local/bin`
-- sudoers snippet
-- Homebrew git shim and restores the original git (if it was shimmed)
+Ubuntu hard mode uninstall (if enabled):
+
+```bash
+sudo ./safeexec.sh uninstall-hard
+```
+
+---
+
+## Security Notes / Limitations
+
+- Any solution can be bypassed by explicitly executing the real diverted binaries:
+  - Ubuntu: `/usr/bin/rm.safeexec.real`
+  - Ubuntu: `/usr/bin/git.safeexec.real`
+- SafeExec intentionally blocks non-TTY execution for gated operations.
+- Hard mode modifies system binary dispatch behavior on Ubuntu; use with care.
 
 ---
