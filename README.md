@@ -1,3 +1,5 @@
+## EXPERIMENTAL WSL VERSION UNTESTED AS I DONT HAVE A WINDOWS MACHINE PLEASE LEAVE FEEDBACK IN ISSUES
+
 # SafeExec: Destructive Command Interceptor (Ubuntu + macOS)
 
 **SafeExec** is a Bash-based safety layer that protects **Ubuntu servers** and **macOS** from accidental (or hallucinated) destructive commands run by AI agents (Codex/GPT) or humans.
