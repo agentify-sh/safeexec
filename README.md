@@ -1,10 +1,8 @@
-## EXPERIMENTAL WSL VERSION UNTESTED AS I DONT HAVE A WINDOWS MACHINE PLEASE LEAVE FEEDBACK IN ISSUES
+# SafeExec: Destructive Command Interceptor (Ubuntu/Debian/WSL + macOS)
 
-# SafeExec: Destructive Command Interceptor (Ubuntu + macOS)
+**SafeExec** is a Bash-based safety layer that protects **Ubuntu/Debian servers**, **WSL**, and **macOS** from accidental (or hallucinated) destructive commands run by AI agents (Codex/GPT) or humans.
 
-**SafeExec** is a Bash-based safety layer that protects **Ubuntu servers** and **macOS** from accidental (or hallucinated) destructive commands run by AI agents (Codex/GPT) or humans.
-
-It intercepts dangerous commands (like `rm -rf` or `git reset --hard`) and enforces an interactive **confirmation gate** via `/dev/tty`. This prevents pipes/non-interactive execution from bypassing safety checks.
+It intercepts dangerous commands (like `rm -rf` or `git reset --hard`) and enforces an interactive **confirmation gate** via a real terminal input. This prevents pipes/non-interactive execution from bypassing safety checks.
 
 ---
 
@@ -12,8 +10,12 @@ It intercepts dangerous commands (like `rm -rf` or `git reset --hard`) and enfor
 
 - **TTY-Based Confirmation Gate**
   - Requires the user to type `confirm` to proceed.
-  - Reads from `/dev/tty` (not stdin), so `echo confirm | ...` doesn’t bypass it.
-  - If there is **no TTY**, the command is **blocked** (exit `126`).
+  - Reads from a real terminal device (not stdin), so `echo confirm | ...` doesn’t bypass it.
+  - If there is **no usable TTY**, the command is **blocked** (exit `126`).
+
+- **WSL/Codex Harness Safety**
+  - Some WSL/Codex setups have `/dev/tty` present but **unusable** (EACCES). SafeExec probes-open it.
+  - If there is no usable terminal input, SafeExec **blocks** rather than “half prompting” inside a TUI.
 
 - **Destructive `rm` Gating**
   - Intercepts only when both recursive + force flags are present:
@@ -27,33 +29,28 @@ It intercepts dangerous commands (like `rm -rf` or `git reset --hard`) and enfor
 
 - **Sudo Protection**
   - Installs `/etc/sudoers.d/safeexec` to prepend SafeExec into `secure_path`,
-    ensuring `sudo rm -rf ...` and `sudo git ...` are intercepted.
+    ensuring `sudo rm -rf ...` and `sudo git ...` are intercepted (soft mode).
 
 - **macOS Homebrew Git Coverage**
   - On Apple Silicon, `git` typically resolves from `/opt/homebrew/bin/git` (often ahead of `/usr/local/bin`).
   - SafeExec installs a **Homebrew git shim** at `/opt/homebrew/bin/git`, backing up the original to:
     - `/opt/homebrew/bin/git.safeexec.real`
 
-- **Ubuntu Hard Mode (Codex Harness Safe)**
-  - Codex/non-interactive harnesses can bypass aliases and even PATH via:
-    - `command -p`, absolute paths (`/usr/bin/rm`), or restricted environment PATH.
-  - SafeExec supports **hard mode** on Ubuntu via `dpkg-divert`:
-    - diverts the real binaries to `*.safeexec.real`
-    - installs tiny wrappers at `/usr/bin/rm` and `/usr/bin/git` that always route through SafeExec
-  - This catches **non-interactive shells, command -p, and absolute paths**.
+- **Ubuntu/Debian/WSL Hard Mode (recommended for Codex/agents)**
+  - Codex/non-interactive harnesses can bypass PATH via:
+    - `command -p rm`, absolute paths (`/usr/bin/rm`), or restricted env PATH.
+  - Hard mode uses `dpkg-divert` to replace `/usr/bin/rm` and `/usr/bin/git` with safe dispatchers,
+    catching **non-interactive shells, command -p, and absolute paths**.
 
 - **Quick Toggle**
   - `safeexec -off` disables prompts **per-user**
   - `safeexec -on` re-enables
   - `safeexec status` prints current state
-  - Global toggle is supported:
+  - Global toggle:
     - `sudo safeexec -off --global`
 
 - **Audit Logging**
   - Logs blocked + confirmed actions to syslog via `logger` (if available).
-
-- **Fail-Safe Install**
-  - Validates sudoers changes using `visudo -c` before installing (if `visudo` exists).
 
 ---
 
@@ -67,7 +64,7 @@ sudo ./safeexec.sh install
 hash -r
 ```
 
-### Ubuntu (Soft Mode)
+### Ubuntu/Debian/WSL (Soft Mode)
 
 ```bash
 chmod +x safeexec.sh
@@ -75,13 +72,14 @@ sudo ./safeexec.sh install
 hash -r
 ```
 
-### Ubuntu (Hard Mode — recommended for Codex/agents)
+### Ubuntu/Debian/WSL (Hard Mode — recommended for Codex/agents)
 
 Hard mode is what makes SafeExec apply to **non-interactive harness execution** and cases where PATH is bypassed.
 
 ```bash
 sudo ./safeexec.sh install
 sudo ./safeexec.sh install-hard
+hash -r
 ```
 
 ---
@@ -111,6 +109,8 @@ Type "confirm" to execute:
 ```
 
 To proceed, type `confirm` + Enter. Any other input (or `Ctrl+C`) cancels with exit code `130`.
+
+If SafeExec cannot access a usable terminal input, it blocks with exit code `126`.
 
 ---
 
@@ -143,7 +143,7 @@ SAFEEXEC_DISABLED=1 git reset --hard
 
 ## ⚙️ How It Works
 
-### Soft Mode (macOS + Ubuntu)
+### Soft Mode (macOS + Linux)
 
 1. Installs wrappers at:
    - `/usr/local/safeexec/bin/rm`
@@ -162,7 +162,7 @@ Because Homebrew’s PATH often wins, SafeExec also installs:
 - Backup stored as:
   - `/opt/homebrew/bin/git.safeexec.real`
 
-### Ubuntu Hard Mode (dpkg-divert)
+### Ubuntu/Debian/WSL Hard Mode (`dpkg-divert`)
 
 1. Diverts real binaries:
    - `/usr/bin/rm` → `/usr/bin/rm.safeexec.real`
@@ -192,7 +192,7 @@ effective gate git: [YES] (homebrew shim)
 safeexec: ON
 ```
 
-### Ubuntu hard mode expected output
+### Ubuntu/Debian/WSL hard mode expected output
 
 ```text
 rm hard-mode:    [YES] (/usr/bin/rm)
@@ -216,7 +216,7 @@ git hard-mode:   [YES] (/usr/bin/git)
 /opt/homebrew/bin/git.safeexec.real reset --hard
 ```
 
-### Ubuntu hard mode bypass
+### Ubuntu/Debian/WSL hard mode bypass
 
 Hard mode is designed to be hard to bypass. If you must bypass in an emergency:
 
@@ -239,7 +239,7 @@ Soft mode uninstall:
 sudo ./safeexec.sh uninstall
 ```
 
-Ubuntu hard mode uninstall (if enabled):
+Hard mode uninstall (if enabled):
 
 ```bash
 sudo ./safeexec.sh uninstall-hard
@@ -247,12 +247,10 @@ sudo ./safeexec.sh uninstall-hard
 
 ---
 
-## Security Notes / Limitations
+## Notes / Limitations
 
-- Any solution can be bypassed by explicitly executing the real diverted binaries:
-  - Ubuntu: `/usr/bin/rm.safeexec.real`
-  - Ubuntu: `/usr/bin/git.safeexec.real`
-- SafeExec intentionally blocks non-TTY execution for gated operations.
-- Hard mode modifies system binary dispatch behavior on Ubuntu; use with care.
-
----
+- Any solution can be bypassed by explicitly executing the real diverted binaries (hard mode):
+  - `/usr/bin/rm.safeexec.real`
+  - `/usr/bin/git.safeexec.real`
+- Under full-screen TUIs (like Codex on Windows), prompts may appear “misplaced” due to UI redraw.
+  SafeExec will block if it cannot read from a real terminal input.
