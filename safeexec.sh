@@ -2,26 +2,25 @@
 set -euo pipefail
 
 # =============================================================================
-# EXPERIMENTAL WSL BRANCH I DONT HAVE A WINDOWS MACHINE SO I COULDNT TEST IF YOU CAN LEAVE AN ISSUE
-# 
+# SAFEEXEC: Destructive Command Interceptor (Ubuntu/Debian/WSL + macOS)
 #
-# SAFEEXEC: Destructive Command Interceptor (+ toggle + Ubuntu hard mode)
+# Soft mode (macOS + Linux):
+#   - Wrappers: /usr/local/safeexec/bin/{rm,git}
+#   - Shims:    /usr/local/bin/{rm,git} -> wrappers
+#   - macOS (Apple Silicon): optional Homebrew git shim at /opt/homebrew/bin/git
 #
-# Soft mode (macOS + Linux): wrappers in /usr/local/safeexec/bin + shims in /usr/local/bin
-# macOS: also installs a Homebrew git shim at /opt/homebrew/bin/git (backs up to git.safeexec.real)
+# Hard mode (Ubuntu/Debian/WSL):
+#   - Uses dpkg-divert to replace /usr/bin/{rm,git} with tiny dispatchers -> wrappers
+#   - Catches non-interactive shells, command -p, and absolute paths
 #
-# Hard mode (Ubuntu): dpkg-divert replaces /usr/bin/rm and /usr/bin/git with tiny wrappers that
-# always dispatch into /usr/local/safeexec/bin/*, catching non-interactive shells, command -p,
-# and absolute paths (/usr/bin/rm, /bin/rm symlink in usrmerge, etc).
-#
-# WSL support:
-# - Some WSL/Codex harness contexts have /dev/tty present but not accessible (EACCES).
-# - We now fall back to stdin when stdin is a real terminal (-t 0). If there is no usable TTY,
-#   we block (exit 126) rather than attempting a broken /dev/tty prompt.
+# WSL/Codex TTY quirks:
+#   - /dev/tty may exist but be EACCES/unusable under some harnesses.
+#   - Wrappers PROBE-open /dev/tty via FDs; if unusable, fall back to stdin only if stdin is a TTY.
+#   - If no usable TTY, gated commands are BLOCKED (exit 126).
 # =============================================================================
 
-SAFEEXEC_DIR="/usr/local/safeexec/bin"
 SAFEEXEC_ROOT="/usr/local/safeexec"
+SAFEEXEC_DIR="$SAFEEXEC_ROOT/bin"
 LOCALBIN="/usr/local/bin"
 SUDOERS_FILE="/etc/sudoers.d/safeexec"
 
@@ -44,7 +43,7 @@ Usage:
   safeexec.sh uninstall
   safeexec.sh status
 
-Ubuntu hard mode:
+Ubuntu/Debian/WSL hard mode:
   safeexec.sh install-hard
   safeexec.sh uninstall-hard
 EOF
@@ -71,42 +70,36 @@ file_has_marker() {
   grep -q "$marker" "$f" 2>/dev/null
 }
 
-# Choose a usable interactive input/output device.
-# Prefer /dev/tty if readable+writable. Otherwise, fall back to stdin IF stdin is a tty (-t 0).
-pick_tty_pair() {
-  # outputs: TTY_IN, TTY_OUT
-  TTY_IN="/dev/tty"
-  TTY_OUT="/dev/tty"
-
+confirm_tty_or_die() {
+  local msg="$1"
   if [[ -r /dev/tty && -w /dev/tty ]]; then
-    return 0
+    # Probe open, not just perms (WSL harness can be EACCES)
+    if exec 9</dev/tty 2>/dev/null && exec 10>/dev/tty 2>/dev/null; then
+      local in out
+      if [[ -e /dev/fd/9 ]]; then in="/dev/fd/9"; out="/dev/fd/10"; else in="/proc/self/fd/9"; out="/proc/self/fd/10"; fi
+      printf "\n%s\nType \"confirm\" to proceed: " "$msg" >"$out"
+      local reply=""
+      if ! IFS= read -r reply <"$in"; then
+        exec 9<&- 2>/dev/null || true
+        exec 10>&- 2>/dev/null || true
+        die "No usable TTY available for confirmation."
+      fi
+      exec 9<&- 2>/dev/null || true
+      exec 10>&- 2>/dev/null || true
+      [[ "$reply" == "confirm" ]] || die "Cancelled."
+      return 0
+    fi
   fi
 
   if [[ -t 0 ]]; then
-    TTY_IN="/dev/fd/0"
-    if [[ -t 2 ]]; then
-      TTY_OUT="/dev/fd/2"
-    elif [[ -t 1 ]]; then
-      TTY_OUT="/dev/fd/1"
-    else
-      TTY_OUT="/dev/fd/2"
-    fi
+    printf "\n%s\nType \"confirm\" to proceed: " "$msg" >&2
+    local reply=""
+    IFS= read -r reply || true
+    [[ "$reply" == "confirm" ]] || die "Cancelled."
     return 0
   fi
 
-  return 1
-}
-
-confirm_tty_or_die() {
-  local msg="$1"
-  if ! pick_tty_pair; then
-    die "No usable TTY available for confirmation (non-interactive/WSL harness)."
-  fi
-  printf "\n%s\nType \"confirm\" to proceed: " "$msg" >"$TTY_OUT"
-  local reply=""
-  IFS= read -r reply <"$TTY_IN" || true
-  printf "\n" >"$TTY_OUT"
-  [[ "$reply" == "confirm" ]] || die "Cancelled."
+  die "No usable TTY available for confirmation."
 }
 
 # =============================================================================
@@ -144,14 +137,29 @@ log_audit() {
   fi
 }
 
+SAFEEXEC_TTY_FDS_OPENED=0
+TTY_IN="/dev/tty"
+TTY_OUT="/dev/tty"
+
 pick_tty_pair() {
+  SAFEEXEC_TTY_FDS_OPENED=0
   TTY_IN="/dev/tty"
   TTY_OUT="/dev/tty"
 
-  if [[ -r /dev/tty && -w /dev/tty ]]; then
+  # Probe-open /dev/tty (WSL harness can have EACCES despite file existing)
+  if exec 9</dev/tty 2>/dev/null && exec 10>/dev/tty 2>/dev/null; then
+    SAFEEXEC_TTY_FDS_OPENED=1
+    if [[ -e /dev/fd/9 ]]; then
+      TTY_IN="/dev/fd/9"
+      TTY_OUT="/dev/fd/10"
+    else
+      TTY_IN="/proc/self/fd/9"
+      TTY_OUT="/proc/self/fd/10"
+    fi
     return 0
   fi
 
+  # Fallback: only if stdin is an actual terminal
   if [[ -t 0 ]]; then
     TTY_IN="/dev/fd/0"
     if [[ -t 2 ]]; then
@@ -167,6 +175,14 @@ pick_tty_pair() {
   return 1
 }
 
+close_tty_pair() {
+  if [[ "$SAFEEXEC_TTY_FDS_OPENED" -eq 1 ]]; then
+    exec 9<&- 2>/dev/null || true
+    exec 10>&- 2>/dev/null || true
+    SAFEEXEC_TTY_FDS_OPENED=0
+  fi
+}
+
 confirm_or_die() {
   local cmd="$1"
   log_audit "BLOCKED: rm $cmd"
@@ -179,8 +195,14 @@ confirm_or_die() {
   local reply=""
   printf '\n\033[0;31m[SAFEEXEC] DESTRUCTIVE COMMAND INTERCEPTED:\033[0m\n  rm %s\n' "$cmd" >"$TTY_OUT"
   printf 'Type "confirm" to execute: ' >"$TTY_OUT"
-  IFS= read -r reply <"$TTY_IN" || true
+
+  if ! IFS= read -r reply <"$TTY_IN"; then
+    close_tty_pair
+    echo "safeexec: BLOCKED (cannot read TTY; cannot prompt): rm $cmd" >&2
+    exit 126
+  fi
   printf '\n' >"$TTY_OUT"
+  close_tty_pair
 
   if [[ "$reply" != "confirm" ]]; then
     echo "safeexec: cancelled" >&2
@@ -267,11 +289,24 @@ log_audit() {
   fi
 }
 
+SAFEEXEC_TTY_FDS_OPENED=0
+TTY_IN="/dev/tty"
+TTY_OUT="/dev/tty"
+
 pick_tty_pair() {
+  SAFEEXEC_TTY_FDS_OPENED=0
   TTY_IN="/dev/tty"
   TTY_OUT="/dev/tty"
 
-  if [[ -r /dev/tty && -w /dev/tty ]]; then
+  if exec 9</dev/tty 2>/dev/null && exec 10>/dev/tty 2>/dev/null; then
+    SAFEEXEC_TTY_FDS_OPENED=1
+    if [[ -e /dev/fd/9 ]]; then
+      TTY_IN="/dev/fd/9"
+      TTY_OUT="/dev/fd/10"
+    else
+      TTY_IN="/proc/self/fd/9"
+      TTY_OUT="/proc/self/fd/10"
+    fi
     return 0
   fi
 
@@ -290,6 +325,14 @@ pick_tty_pair() {
   return 1
 }
 
+close_tty_pair() {
+  if [[ "$SAFEEXEC_TTY_FDS_OPENED" -eq 1 ]]; then
+    exec 9<&- 2>/dev/null || true
+    exec 10>&- 2>/dev/null || true
+    SAFEEXEC_TTY_FDS_OPENED=0
+  fi
+}
+
 confirm_or_die() {
   local cmd="$1"
   log_audit "BLOCKED: git $cmd"
@@ -302,8 +345,14 @@ confirm_or_die() {
   local reply=""
   printf '\n\033[0;33m[SAFEEXEC] DESTRUCTIVE COMMAND INTERCEPTED:\033[0m\n  git %s\n' "$cmd" >"$TTY_OUT"
   printf 'Type "confirm" to execute: ' >"$TTY_OUT"
-  IFS= read -r reply <"$TTY_IN" || true
+
+  if ! IFS= read -r reply <"$TTY_IN"; then
+    close_tty_pair
+    echo "safeexec: BLOCKED (cannot read TTY; cannot prompt): git $cmd" >&2
+    exit 126
+  fi
   printf '\n' >"$TTY_OUT"
+  close_tty_pair
 
   if [[ "$reply" != "confirm" ]]; then
     echo "safeexec: cancelled" >&2
@@ -313,14 +362,14 @@ confirm_or_die() {
   log_audit "CONFIRMED: git $cmd"
 }
 
-# Prefer dpkg-divert real binary if present
+# Prefer dpkg-divert / homebrew backup if present
 REAL_GIT=""
 for cand in \
   /usr/bin/git.safeexec.real \
   /bin/git.safeexec.real \
   /opt/homebrew/bin/git.safeexec.real \
-  /opt/homebrew/bin/git \
   /usr/local/bin/git.safeexec.real \
+  /opt/homebrew/bin/git \
   /usr/local/bin/git \
   /usr/bin/git \
   /bin/git \
@@ -575,12 +624,12 @@ remove_sudo_secure_path() {
 }
 
 # =============================================================================
-# Ubuntu hard mode (dpkg-divert)
+# Ubuntu/Debian/WSL hard mode (dpkg-divert)
 # =============================================================================
 
 dpkg_divert_install_one() {
   local cmd="$1"
-  command -v dpkg-divert >/dev/null 2>&1 || die "dpkg-divert not found (hard mode requires Ubuntu/Debian)."
+  command -v dpkg-divert >/dev/null 2>&1 || die "dpkg-divert not found (hard mode requires Ubuntu/Debian/WSL)."
 
   local sys_path=""
   sys_path="$(command -p -v "$cmd" 2>/dev/null || true)"
@@ -638,9 +687,9 @@ dpkg_divert_remove_one() {
 
 cmd_install_hard() {
   need_root
-  is_linux || die "install-hard is only supported on Ubuntu/Debian Linux (dpkg-divert). macOS cannot hard-replace /usr/bin."
+  is_linux || die "install-hard is only supported on Ubuntu/Debian/WSL Linux (dpkg-divert). macOS cannot hard-replace /usr/bin."
 
-  confirm_tty_or_die "[SAFEEXEC HARD MODE] This will dpkg-divert /usr/bin/rm and /usr/bin/git so they ALWAYS route through safeexec (even non-interactive + command -p + absolute paths)."
+  confirm_tty_or_die "[SAFEEXEC HARD MODE] This will dpkg-divert /usr/bin/rm and /usr/bin/git so they ALWAYS route through safeexec (non-interactive + command -p + absolute paths)."
 
   write_wrapper_rm
   write_wrapper_git
@@ -651,12 +700,12 @@ cmd_install_hard() {
   dpkg_divert_install_one rm
   dpkg_divert_install_one git
 
-  echo "safeexec: HARD MODE active (Ubuntu)."
+  echo "safeexec: HARD MODE active."
 }
 
 cmd_uninstall_hard() {
   need_root
-  is_linux || die "uninstall-hard is only supported on Ubuntu/Debian Linux."
+  is_linux || die "uninstall-hard is only supported on Ubuntu/Debian/WSL Linux."
 
   dpkg_divert_remove_one git
   dpkg_divert_remove_one rm
@@ -701,7 +750,7 @@ cmd_install() {
   echo "safeexec: toggle with: safeexec -on | safeexec -off"
   echo "safeexec: for current shell: hash -r"
   if is_linux; then
-    echo "safeexec: to catch Codex harness non-interactive on Ubuntu/WSL: sudo ./safeexec.sh install-hard"
+    echo "safeexec: for Codex/agents on Ubuntu/WSL, enable hard mode: sudo ./safeexec.sh install-hard"
   fi
 }
 
