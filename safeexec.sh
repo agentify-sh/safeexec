@@ -2,6 +2,9 @@
 set -euo pipefail
 
 # =============================================================================
+# EXPERIMENTAL WSL BRANCH I DONT HAVE A WINDOWS MACHINE SO I COULDNT TEST IF YOU CAN LEAVE AN ISSUE
+# 
+#
 # SAFEEXEC: Destructive Command Interceptor (+ toggle + Ubuntu hard mode)
 #
 # Soft mode (macOS + Linux): wrappers in /usr/local/safeexec/bin + shims in /usr/local/bin
@@ -10,6 +13,11 @@ set -euo pipefail
 # Hard mode (Ubuntu): dpkg-divert replaces /usr/bin/rm and /usr/bin/git with tiny wrappers that
 # always dispatch into /usr/local/safeexec/bin/*, catching non-interactive shells, command -p,
 # and absolute paths (/usr/bin/rm, /bin/rm symlink in usrmerge, etc).
+#
+# WSL support:
+# - Some WSL/Codex harness contexts have /dev/tty present but not accessible (EACCES).
+# - We now fall back to stdin when stdin is a real terminal (-t 0). If there is no usable TTY,
+#   we block (exit 126) rather than attempting a broken /dev/tty prompt.
 # =============================================================================
 
 SAFEEXEC_DIR="/usr/local/safeexec/bin"
@@ -63,13 +71,41 @@ file_has_marker() {
   grep -q "$marker" "$f" 2>/dev/null
 }
 
+# Choose a usable interactive input/output device.
+# Prefer /dev/tty if readable+writable. Otherwise, fall back to stdin IF stdin is a tty (-t 0).
+pick_tty_pair() {
+  # outputs: TTY_IN, TTY_OUT
+  TTY_IN="/dev/tty"
+  TTY_OUT="/dev/tty"
+
+  if [[ -r /dev/tty && -w /dev/tty ]]; then
+    return 0
+  fi
+
+  if [[ -t 0 ]]; then
+    TTY_IN="/dev/fd/0"
+    if [[ -t 2 ]]; then
+      TTY_OUT="/dev/fd/2"
+    elif [[ -t 1 ]]; then
+      TTY_OUT="/dev/fd/1"
+    else
+      TTY_OUT="/dev/fd/2"
+    fi
+    return 0
+  fi
+
+  return 1
+}
+
 confirm_tty_or_die() {
   local msg="$1"
-  [[ -e /dev/tty ]] || die "No /dev/tty available for confirmation."
-  printf "\n%s\nType \"confirm\" to proceed: " "$msg" > /dev/tty
+  if ! pick_tty_pair; then
+    die "No usable TTY available for confirmation (non-interactive/WSL harness)."
+  fi
+  printf "\n%s\nType \"confirm\" to proceed: " "$msg" >"$TTY_OUT"
   local reply=""
-  IFS= read -r reply < /dev/tty || true
-  printf "\n" > /dev/tty
+  IFS= read -r reply <"$TTY_IN" || true
+  printf "\n" >"$TTY_OUT"
   [[ "$reply" == "confirm" ]] || die "Cancelled."
 }
 
@@ -108,20 +144,43 @@ log_audit() {
   fi
 }
 
+pick_tty_pair() {
+  TTY_IN="/dev/tty"
+  TTY_OUT="/dev/tty"
+
+  if [[ -r /dev/tty && -w /dev/tty ]]; then
+    return 0
+  fi
+
+  if [[ -t 0 ]]; then
+    TTY_IN="/dev/fd/0"
+    if [[ -t 2 ]]; then
+      TTY_OUT="/dev/fd/2"
+    elif [[ -t 1 ]]; then
+      TTY_OUT="/dev/fd/1"
+    else
+      TTY_OUT="/dev/fd/2"
+    fi
+    return 0
+  fi
+
+  return 1
+}
+
 confirm_or_die() {
   local cmd="$1"
   log_audit "BLOCKED: rm $cmd"
 
-  if [[ ! -e /dev/tty ]]; then
-    echo "safeexec: BLOCKED (no /dev/tty): rm $cmd" >&2
+  if ! pick_tty_pair; then
+    echo "safeexec: BLOCKED (no usable TTY; cannot prompt): rm $cmd" >&2
     exit 126
   fi
 
   local reply=""
-  printf '\n\033[0;31m[SAFEEXEC] DESTRUCTIVE COMMAND INTERCEPTED:\033[0m\n  rm %s\n' "$cmd" > /dev/tty
-  printf 'Type "confirm" to execute: ' > /dev/tty
-  IFS= read -r reply < /dev/tty || true
-  printf '\n' > /dev/tty
+  printf '\n\033[0;31m[SAFEEXEC] DESTRUCTIVE COMMAND INTERCEPTED:\033[0m\n  rm %s\n' "$cmd" >"$TTY_OUT"
+  printf 'Type "confirm" to execute: ' >"$TTY_OUT"
+  IFS= read -r reply <"$TTY_IN" || true
+  printf '\n' >"$TTY_OUT"
 
   if [[ "$reply" != "confirm" ]]; then
     echo "safeexec: cancelled" >&2
@@ -208,20 +267,43 @@ log_audit() {
   fi
 }
 
+pick_tty_pair() {
+  TTY_IN="/dev/tty"
+  TTY_OUT="/dev/tty"
+
+  if [[ -r /dev/tty && -w /dev/tty ]]; then
+    return 0
+  fi
+
+  if [[ -t 0 ]]; then
+    TTY_IN="/dev/fd/0"
+    if [[ -t 2 ]]; then
+      TTY_OUT="/dev/fd/2"
+    elif [[ -t 1 ]]; then
+      TTY_OUT="/dev/fd/1"
+    else
+      TTY_OUT="/dev/fd/2"
+    fi
+    return 0
+  fi
+
+  return 1
+}
+
 confirm_or_die() {
   local cmd="$1"
   log_audit "BLOCKED: git $cmd"
 
-  if [[ ! -e /dev/tty ]]; then
-    echo "safeexec: BLOCKED (no /dev/tty): git $cmd" >&2
+  if ! pick_tty_pair; then
+    echo "safeexec: BLOCKED (no usable TTY; cannot prompt): git $cmd" >&2
     exit 126
   fi
 
   local reply=""
-  printf '\n\033[0;33m[SAFEEXEC] DESTRUCTIVE COMMAND INTERCEPTED:\033[0m\n  git %s\n' "$cmd" > /dev/tty
-  printf 'Type "confirm" to execute: ' > /dev/tty
-  IFS= read -r reply < /dev/tty || true
-  printf '\n' > /dev/tty
+  printf '\n\033[0;33m[SAFEEXEC] DESTRUCTIVE COMMAND INTERCEPTED:\033[0m\n  git %s\n' "$cmd" >"$TTY_OUT"
+  printf 'Type "confirm" to execute: ' >"$TTY_OUT"
+  IFS= read -r reply <"$TTY_IN" || true
+  printf '\n' >"$TTY_OUT"
 
   if [[ "$reply" != "confirm" ]]; then
     echo "safeexec: cancelled" >&2
@@ -348,7 +430,7 @@ remove_localbin_shims() {
   done
 }
 
-# macOS: ensure /opt/homebrew/bin/git hits safeexec (PATH usually prefers /opt/homebrew/bin)
+# macOS: ensure /opt/homebrew/bin/git hits safeexec
 install_homebrew_git_shim() {
   is_darwin || return 0
   [[ -e "$HOMEBREW_GIT" ]] || return 0
@@ -358,7 +440,6 @@ install_homebrew_git_shim() {
     return 0
   fi
 
-  # Move file OR symlink out of the way
   if ! mv "$HOMEBREW_GIT" "$HOMEBREW_GIT_REAL"; then
     echo "safeexec: WARNING: failed to move $HOMEBREW_GIT; Homebrew git shim NOT installed."
     return 0
@@ -505,14 +586,12 @@ dpkg_divert_install_one() {
   sys_path="$(command -p -v "$cmd" 2>/dev/null || true)"
   [[ -n "$sys_path" ]] || die "Cannot locate system $cmd via command -p."
 
-  # Canonicalize
   if command -v readlink >/dev/null 2>&1; then
     sys_path="$(readlink -f "$sys_path" 2>/dev/null || echo "$sys_path")"
   fi
 
   local divert="${sys_path}.safeexec.real"
 
-  # Already hard-installed?
   if [[ -e "$divert" ]] && file_has_marker "$sys_path" "$MARK_HARD"; then
     echo "safeexec: hard-mode already active for $cmd at $sys_path"
     return 0
@@ -545,7 +624,6 @@ dpkg_divert_remove_one() {
 
   local divert="${sys_path}.safeexec.real"
 
-  # If command -p resolves to our wrapper, sys_path is still correct; proceed.
   if [[ -f "$sys_path" ]] && file_has_marker "$sys_path" "$MARK_HARD"; then
     rm -f "$sys_path"
   fi
@@ -564,7 +642,6 @@ cmd_install_hard() {
 
   confirm_tty_or_die "[SAFEEXEC HARD MODE] This will dpkg-divert /usr/bin/rm and /usr/bin/git so they ALWAYS route through safeexec (even non-interactive + command -p + absolute paths)."
 
-  # Ensure soft components exist first
   write_wrapper_rm
   write_wrapper_git
   install_safeexec_cli
@@ -575,8 +652,6 @@ cmd_install_hard() {
   dpkg_divert_install_one git
 
   echo "safeexec: HARD MODE active (Ubuntu)."
-  echo "safeexec: toggle per-user: safeexec -off | safeexec -on"
-  echo "safeexec: toggle global:  sudo safeexec -off --global | sudo safeexec -on --global"
 }
 
 cmd_uninstall_hard() {
@@ -626,7 +701,7 @@ cmd_install() {
   echo "safeexec: toggle with: safeexec -on | safeexec -off"
   echo "safeexec: for current shell: hash -r"
   if is_linux; then
-    echo "safeexec: to catch Codex harness non-interactive on Ubuntu: sudo ./safeexec.sh install-hard"
+    echo "safeexec: to catch Codex harness non-interactive on Ubuntu/WSL: sudo ./safeexec.sh install-hard"
   fi
 }
 
