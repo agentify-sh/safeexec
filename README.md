@@ -14,7 +14,7 @@ It intercepts dangerous commands (like `rm -rf` or `git reset --hard`) and enfor
   - If there is **no usable TTY**, the command is **blocked** (exit `126`).
 
 - **WSL/Codex Harness Safety**
-  - Some WSL/Codex setups have `/dev/tty` present but **unusable** (EACCES). SafeExec probes-open it.
+  - Some WSL/Codex setups have `/dev/tty` present but **unusable** (EACCES). SafeExec probe-opens it.
   - If there is no usable terminal input, SafeExec **blocks** rather than “half prompting” inside a TUI.
 
 - **Destructive `rm` Gating**
@@ -32,9 +32,13 @@ It intercepts dangerous commands (like `rm -rf` or `git reset --hard`) and enfor
     ensuring `sudo rm -rf ...` and `sudo git ...` are intercepted (soft mode).
 
 - **macOS Homebrew Git Coverage**
-  - On Apple Silicon, `git` typically resolves from `/opt/homebrew/bin/git` (often ahead of `/usr/local/bin`).
-  - SafeExec installs a **Homebrew git shim** at `/opt/homebrew/bin/git`, backing up the original to:
+  - Apple Silicon (default Homebrew prefix): `git` usually resolves from `/opt/homebrew/bin/git`.
+    SafeExec installs a **Homebrew git shim** there, backing up the original to:
     - `/opt/homebrew/bin/git.safeexec.real`
+  - Intel macOS (common Homebrew prefix): `git` may resolve from `/usr/local/bin/git` which is often a
+    Homebrew symlink into Cellar. SafeExec will detect this case and **safely back it up** to:
+    - `/usr/local/bin/git.safeexec.real`
+    then install the SafeExec shim at `/usr/local/bin/git`.
 
 - **Ubuntu/Debian/WSL Hard Mode (recommended for Codex/agents)**
   - Codex/non-interactive harnesses can bypass PATH via:
@@ -162,6 +166,22 @@ Because Homebrew’s PATH often wins, SafeExec also installs:
 - Backup stored as:
   - `/opt/homebrew/bin/git.safeexec.real`
 
+### macOS Intel Homebrew Symlink Backup
+
+If Homebrew owns `/usr/local/bin/git` as a symlink into Cellar (common on Intel macOS),
+SafeExec will:
+
+- Move the existing symlink to: `/usr/local/bin/git.safeexec.real`
+- Install its shim at: `/usr/local/bin/git`
+
+Rollback:
+
+```bash
+sudo rm /usr/local/bin/git
+sudo mv /usr/local/bin/git.safeexec.real /usr/local/bin/git
+hash -r
+```
+
 ### Ubuntu/Debian/WSL Hard Mode (`dpkg-divert`)
 
 1. Diverts real binaries:
@@ -183,13 +203,18 @@ Result: even `command -p rm`, absolute paths, and minimal environment shells are
 
 ### macOS expected output (PATH may be NO, that’s fine)
 
+Apple Silicon:
+
 ```text
-PATH includes SAFEEXEC_DIR: [NO] (OK if shims win)
-which rm:  /usr/local/bin/rm
 which git: /opt/homebrew/bin/git
-effective gate rm:  [YES]
 effective gate git: [YES] (homebrew shim)
-safeexec: ON
+```
+
+Intel (example):
+
+```text
+which git: /usr/local/bin/git
+effective gate git: [YES]
 ```
 
 ### Ubuntu/Debian/WSL hard mode expected output
