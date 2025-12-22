@@ -17,6 +17,11 @@ set -euo pipefail
 #   - /dev/tty may exist but be EACCES/unusable under some harnesses.
 #   - Wrappers PROBE-open /dev/tty via FDs; if unusable, fall back to stdin only if stdin is a TTY.
 #   - If no usable TTY, gated commands are BLOCKED (exit 126).
+#
+# macOS Homebrew git quirks:
+#   - On Intel Homebrew, /usr/local/bin/git is often a symlink into Cellar.
+#   - Installer will now (only for git) detect a Homebrew Cellar symlink and safely
+#     back it up to /usr/local/bin/git.safeexec.real, then install our shim.
 # =============================================================================
 
 SAFEEXEC_ROOT="/usr/local/safeexec"
@@ -70,10 +75,30 @@ file_has_marker() {
   grep -q "$marker" "$f" 2>/dev/null
 }
 
+# Detect if a symlink is Homebrew's git (Intel: /usr/local, or various cellar paths).
+is_homebrew_git_symlink() {
+  local link="$1"
+  [[ -L "$link" ]] || return 1
+  local val resolved
+  val="$(readlink "$link" 2>/dev/null || true)"
+  resolved="$val"
+  if command -v readlink >/dev/null 2>&1; then
+    resolved="$(readlink -f "$link" 2>/dev/null || echo "$val")"
+  fi
+
+  case " $val $resolved " in
+    *"Cellar/git/"*|*"Homebrew/Cellar/git/"*|*"homebrew/Cellar/git/"*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 confirm_tty_or_die() {
   local msg="$1"
   if [[ -r /dev/tty && -w /dev/tty ]]; then
-    # Probe open, not just perms (WSL harness can be EACCES)
     if exec 9</dev/tty 2>/dev/null && exec 10>/dev/tty 2>/dev/null; then
       local in out
       if [[ -e /dev/fd/9 ]]; then in="/dev/fd/9"; out="/dev/fd/10"; else in="/proc/self/fd/9"; out="/proc/self/fd/10"; fi
@@ -146,7 +171,6 @@ pick_tty_pair() {
   TTY_IN="/dev/tty"
   TTY_OUT="/dev/tty"
 
-  # Probe-open /dev/tty (WSL harness can have EACCES despite file existing)
   if exec 9</dev/tty 2>/dev/null && exec 10>/dev/tty 2>/dev/null; then
     SAFEEXEC_TTY_FDS_OPENED=1
     if [[ -e /dev/fd/9 ]]; then
@@ -159,7 +183,6 @@ pick_tty_pair() {
     return 0
   fi
 
-  # Fallback: only if stdin is an actual terminal
   if [[ -t 0 ]]; then
     TTY_IN="/dev/fd/0"
     if [[ -t 2 ]]; then
@@ -212,7 +235,6 @@ confirm_or_die() {
   log_audit "CONFIRMED: rm $cmd"
 }
 
-# Prefer dpkg-divert real binary if present
 REAL_RM=""
 for cand in /usr/bin/rm.safeexec.real /bin/rm.safeexec.real /usr/bin/rm /bin/rm; do
   if [[ -x "$cand" ]] && ! [[ "$cand" -ef "$0" ]]; then
@@ -230,7 +252,6 @@ fi
 
 force=0
 rec=0
-
 for arg in "$@"; do
   case "$arg" in
     --) break ;;
@@ -362,7 +383,6 @@ confirm_or_die() {
   log_audit "CONFIRMED: git $cmd"
 }
 
-# Prefer dpkg-divert / homebrew backup if present
 REAL_GIT=""
 for cand in \
   /usr/bin/git.safeexec.real \
@@ -449,6 +469,7 @@ install_localbin_shims() {
   for c in rm git; do
     local target="$LOCALBIN/$c"
     local src="$SAFEEXEC_DIR/$c"
+    local backup="${target}.safeexec.real"
 
     if symlink_points_to "$target" "$src"; then
       continue
@@ -460,6 +481,18 @@ install_localbin_shims() {
     fi
 
     if [[ -L "$target" ]] && ! symlink_points_to "$target" "$src"; then
+      # Special-case: macOS Intel Homebrew often owns /usr/local/bin/git as a symlink into Cellar.
+      if [[ "$c" == "git" ]] && is_darwin && is_homebrew_git_symlink "$target"; then
+        if [[ -e "$backup" ]]; then
+          echo "safeexec: WARNING: $backup already exists; not modifying $target."
+          continue
+        fi
+        mv "$target" "$backup"
+        ln -s "$src" "$target"
+        echo "safeexec: backed up Homebrew git symlink ($target -> $backup) and installed safeexec shim."
+        continue
+      fi
+
       echo "safeexec: WARNING: $target is a symlink not managed by safeexec; leaving it alone."
       continue
     fi
@@ -473,13 +506,26 @@ remove_localbin_shims() {
   for c in rm git; do
     local target="$LOCALBIN/$c"
     local src="$SAFEEXEC_DIR/$c"
+    local backup="${target}.safeexec.real"
+
     if symlink_points_to "$target" "$src"; then
       rm -f "$target"
+    fi
+
+    # Restore backup if we created one (e.g. Homebrew /usr/local/bin/git)
+    if [[ -e "$backup" ]]; then
+      # Only restore if target is missing (or is our shim which we just removed)
+      if [[ ! -e "$target" ]]; then
+        mv "$backup" "$target"
+      else
+        # Don't overwrite user's current target
+        echo "safeexec: WARNING: not restoring $backup because $target exists."
+      fi
     fi
   done
 }
 
-# macOS: ensure /opt/homebrew/bin/git hits safeexec
+# macOS Apple Silicon: ensure /opt/homebrew/bin/git hits safeexec
 install_homebrew_git_shim() {
   is_darwin || return 0
   [[ -e "$HOMEBREW_GIT" ]] || return 0
