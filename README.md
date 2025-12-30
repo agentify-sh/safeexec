@@ -4,6 +4,8 @@
 
 It intercepts dangerous commands (like `rm -rf` or `git reset --hard`) and enforces an interactive **confirmation gate** via a real terminal input. This prevents pipes/non-interactive execution from bypassing safety checks.
 
+> **Note:** SafeExec no longer edits `/etc/*` or shell dotfiles automatically. Older versions injected `case` blocks into zsh/bash init files and caused parse errors on some setups. Current versions rely on shims + (macOS) Homebrew git shim, and optional hard mode on Ubuntu/Debian/WSL.
+
 ---
 
 ## 🛡️ Features
@@ -223,6 +225,18 @@ effective gate git: [YES]
 rm hard-mode:    [YES] (/usr/bin/rm)
 git hard-mode:   [YES] (/usr/bin/git)
 ```
+
+---
+
+## 🧹 Cleanup old broken SAFEEXEC blocks (if you see shell parse errors)
+
+If you previously installed an older SafeExec version that injected `SAFEEXEC BEGIN/END` blocks into shell init files and your shells are now erroring on startup:
+
+```bash
+sudo ./safeexec.sh cleanup-dotfiles
+```
+
+This removes `# SAFEEXEC BEGIN` → `# SAFEEXEC END` blocks from common `/etc/*` and `~/*` init files (best-effort).
 
 ---
 
