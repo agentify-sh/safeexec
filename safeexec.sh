@@ -4,27 +4,19 @@ set -euo pipefail
 # =============================================================================
 # SAFEEXEC: Destructive Command Interceptor (Ubuntu/Debian/WSL + macOS)
 #
-# IMPORTANT:
-# - SafeExec NO LONGER edits /etc/* or ~/.{bash,zsh}* dotfiles automatically. Older versions did and
-#   caused parse errors on some zsh setups. We rely on shims + (macOS) Homebrew git shim, and
-#   (Ubuntu/Debian/WSL) optional hard mode via dpkg-divert.
+# This installer:
+#   - Installs wrappers in: /usr/local/safeexec/bin/{rm,git}
+#   - Installs shims in:    /usr/local/bin/{rm,git}  -> wrappers
+#   - Installs CLI toggle:  /usr/local/bin/safeexec
+#   - macOS Apple Silicon: installs Homebrew git shim at /opt/homebrew/bin/git
+#   - macOS Intel Homebrew: if /usr/local/bin/git is a Homebrew Cellar symlink, backs it up
+#                           to /usr/local/bin/git.safeexec.real and installs our shim.
+#   - Ubuntu/Debian/WSL: optional hard mode via dpkg-divert to catch absolute paths and command -p.
 #
-# Soft mode (macOS + Linux):
-#   - Wrappers: /usr/local/safeexec/bin/{rm,git}
-#   - Shims:    /usr/local/bin/{rm,git} -> wrappers
-#   - macOS Apple Silicon: optional Homebrew git shim at /opt/homebrew/bin/git
-#   - macOS Intel: if /usr/local/bin/git is a Homebrew Cellar symlink, back it up to
-#     /usr/local/bin/git.safeexec.real and install our shim there.
-#
-# Hard mode (Ubuntu/Debian/WSL):
-#   - Uses dpkg-divert to replace /usr/bin/{rm,git} with tiny dispatchers -> wrappers
-#   - Catches non-interactive shells, command -p, and absolute paths
-#
-# WSL/Codex TTY quirks:
-#   - /dev/tty may exist but be EACCES/unusable under some harnesses.
-#   - Wrappers PROBE-open /dev/tty via FDs; if unusable, fall back to stdin only if stdin is a TTY.
-#   - If no usable TTY, gated commands are BLOCKED (exit 126).
+# It does NOT edit shell init files (/etc/z*rc, ~/.zshrc, etc).
 # =============================================================================
+
+VERSION="0.6.0"
 
 SAFEEXEC_ROOT="/usr/local/safeexec"
 SAFEEXEC_DIR="$SAFEEXEC_ROOT/bin"
@@ -53,9 +45,6 @@ Usage:
 Ubuntu/Debian/WSL hard mode:
   safeexec.sh install-hard
   safeexec.sh uninstall-hard
-
-Cleanup old broken SAFEEXEC blocks in shell init files:
-  safeexec.sh cleanup-dotfiles
 EOF
   exit 2
 }
@@ -77,58 +66,36 @@ symlink_points_to() {
 file_has_marker() {
   local f="$1" marker="$2"
   [[ -f "$f" ]] || return 1
-  grep -q "$marker" 2>/dev/null <"$f"
+  grep -q "$marker" "$f" 2>/dev/null
 }
 
+# Detect common Homebrew git symlink targets (Cellar paths)
 is_homebrew_git_symlink() {
   local link="$1"
   [[ -L "$link" ]] || return 1
+
   local val resolved
   val="$(readlink "$link" 2>/dev/null || true)"
   resolved="$val"
+
   if command -v readlink >/dev/null 2>&1; then
     resolved="$(readlink -f "$link" 2>/dev/null || echo "$val")"
   fi
+
   case " $val $resolved " in
     *"Cellar/git/"*|*"Homebrew/Cellar/git/"*|*"homebrew/Cellar/git/"*) return 0 ;;
     *) return 1 ;;
   esac
 }
 
-confirm_tty_or_die() {
-  local msg="$1"
-  if [[ -r /dev/tty && -w /dev/tty ]]; then
-    if exec 9</dev/tty 2>/dev/null && exec 10>/dev/tty 2>/dev/null; then
-      local in out
-      if [[ -e /dev/fd/9 ]]; then in="/dev/fd/9"; out="/dev/fd/10"; else in="/proc/self/fd/9"; out="/proc/self/fd/10"; fi
-      printf "\n%s\nType \"confirm\" to proceed: " "$msg" >"$out"
-      local reply=""
-      if ! IFS= read -r reply <"$in"; then
-        exec 9<&- 2>/dev/null || true
-        exec 10>&- 2>/dev/null || true
-        die "No usable TTY available for confirmation."
-      fi
-      exec 9<&- 2>/dev/null || true
-      exec 10>&- 2>/dev/null || true
-      [[ "$reply" == "confirm" ]] || die "Cancelled."
-      return 0
-    fi
-  fi
-
-  if [[ -t 0 ]]; then
-    printf "\n%s\nType \"confirm\" to proceed: " "$msg" >&2
-    local reply=""
-    IFS= read -r reply || true
-    [[ "$reply" == "confirm" ]] || die "Cancelled."
-    return 0
-  fi
-
-  die "No usable TTY available for confirmation."
-}
+# =============================================================================
+# WRAPPERS (in /usr/local/safeexec/bin)
+# =============================================================================
 
 write_wrapper_rm() {
   ensure_dir_0755 "$SAFEEXEC_DIR"
   local dst="$SAFEEXEC_DIR/rm"
+
   cat >"$dst" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -161,24 +128,32 @@ pick_tty_pair() {
   TTY_IN="/dev/tty"
   TTY_OUT="/dev/tty"
 
+  # Probe-open /dev/tty (WSL harness can be EACCES even if file exists)
   if exec 9</dev/tty 2>/dev/null && exec 10>/dev/tty 2>/dev/null; then
     SAFEEXEC_TTY_FDS_OPENED=1
     if [[ -e /dev/fd/9 ]]; then
-      TTY_IN="/dev/fd/9"; TTY_OUT="/dev/fd/10"
+      TTY_IN="/dev/fd/9"
+      TTY_OUT="/dev/fd/10"
     else
-      TTY_IN="/proc/self/fd/9"; TTY_OUT="/proc/self/fd/10"
+      TTY_IN="/proc/self/fd/9"
+      TTY_OUT="/proc/self/fd/10"
     fi
     return 0
   fi
 
+  # Fallback only if stdin is a TTY
   if [[ -t 0 ]]; then
     TTY_IN="/dev/fd/0"
-    if [[ -t 2 ]]; then TTY_OUT="/dev/fd/2"
-    elif [[ -t 1 ]]; then TTY_OUT="/dev/fd/1"
-    else TTY_OUT="/dev/fd/2"
+    if [[ -t 2 ]]; then
+      TTY_OUT="/dev/fd/2"
+    elif [[ -t 1 ]]; then
+      TTY_OUT="/dev/fd/1"
+    else
+      TTY_OUT="/dev/fd/2"
     fi
     return 0
   fi
+
   return 1
 }
 
@@ -211,20 +186,30 @@ confirm_or_die() {
   printf '\n' >"$TTY_OUT"
   close_tty_pair
 
-  [[ "$reply" == "confirm" ]] || { echo "safeexec: cancelled" >&2; exit 130; }
+  if [[ "$reply" != "confirm" ]]; then
+    echo "safeexec: cancelled" >&2
+    exit 130
+  fi
 
   log_audit "CONFIRMED: rm $cmd"
 }
 
+# Prefer diverted real binary if present
 REAL_RM=""
 for cand in /usr/bin/rm.safeexec.real /bin/rm.safeexec.real /usr/bin/rm /bin/rm; do
-  if [[ -x "$cand" ]] && ! [[ "$cand" -ef "$0" ]]; then REAL_RM="$cand"; break; fi
+  if [[ -x "$cand" ]] && ! [[ "$cand" -ef "$0" ]]; then
+    REAL_RM="$cand"
+    break
+  fi
 done
 [[ -n "$REAL_RM" ]] || REAL_RM="$(command -p -v rm 2>/dev/null || echo '/bin/rm')"
 
-if is_disabled; then exec "$REAL_RM" "$@"; fi
+if is_disabled; then
+  exec "$REAL_RM" "$@"
+fi
 
-force=0; rec=0
+force=0
+rec=0
 for arg in "$@"; do
   case "$arg" in
     --) break ;;
@@ -247,12 +232,14 @@ fi
 
 exec "$REAL_RM" "$@"
 EOF
+
   chmod 0755 "$dst"
 }
 
 write_wrapper_git() {
   ensure_dir_0755 "$SAFEEXEC_DIR"
   local dst="$SAFEEXEC_DIR/git"
+
   cat >"$dst" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -288,21 +275,27 @@ pick_tty_pair() {
   if exec 9</dev/tty 2>/dev/null && exec 10>/dev/tty 2>/dev/null; then
     SAFEEXEC_TTY_FDS_OPENED=1
     if [[ -e /dev/fd/9 ]]; then
-      TTY_IN="/dev/fd/9"; TTY_OUT="/dev/fd/10"
+      TTY_IN="/dev/fd/9"
+      TTY_OUT="/dev/fd/10"
     else
-      TTY_IN="/proc/self/fd/9"; TTY_OUT="/proc/self/fd/10"
+      TTY_IN="/proc/self/fd/9"
+      TTY_OUT="/proc/self/fd/10"
     fi
     return 0
   fi
 
   if [[ -t 0 ]]; then
     TTY_IN="/dev/fd/0"
-    if [[ -t 2 ]]; then TTY_OUT="/dev/fd/2"
-    elif [[ -t 1 ]]; then TTY_OUT="/dev/fd/1"
-    else TTY_OUT="/dev/fd/2"
+    if [[ -t 2 ]]; then
+      TTY_OUT="/dev/fd/2"
+    elif [[ -t 1 ]]; then
+      TTY_OUT="/dev/fd/1"
+    else
+      TTY_OUT="/dev/fd/2"
     fi
     return 0
   fi
+
   return 1
 }
 
@@ -335,26 +328,49 @@ confirm_or_die() {
   printf '\n' >"$TTY_OUT"
   close_tty_pair
 
-  [[ "$reply" == "confirm" ]] || { echo "safeexec: cancelled" >&2; exit 130; }
+  if [[ "$reply" != "confirm" ]]; then
+    echo "safeexec: cancelled" >&2
+    exit 130
+  fi
 
   log_audit "CONFIRMED: git $cmd"
 }
 
+# Prefer diverted / backed-up real binary if present
 REAL_GIT=""
-for cand in   /usr/bin/git.safeexec.real /bin/git.safeexec.real   /opt/homebrew/bin/git.safeexec.real /usr/local/bin/git.safeexec.real   /opt/homebrew/bin/git /usr/local/bin/git /usr/bin/git /bin/git ; do
-  if [[ -x "$cand" ]] && ! [[ "$cand" -ef "$0" ]]; then REAL_GIT="$cand"; break; fi
+for cand in \
+  /usr/bin/git.safeexec.real \
+  /bin/git.safeexec.real \
+  /opt/homebrew/bin/git.safeexec.real \
+  /usr/local/bin/git.safeexec.real \
+  /opt/homebrew/bin/git \
+  /usr/local/bin/git \
+  /usr/bin/git \
+  /bin/git \
+; do
+  if [[ -x "$cand" ]] && ! [[ "$cand" -ef "$0" ]]; then
+    REAL_GIT="$cand"
+    break
+  fi
 done
 [[ -n "$REAL_GIT" ]] || REAL_GIT="$(command -p -v git 2>/dev/null || echo '/usr/bin/git')"
 
-if is_disabled; then exec "$REAL_GIT" "$@"; fi
+if is_disabled; then
+  exec "$REAL_GIT" "$@"
+fi
 
-args=("$@"); subcmd=""; subcmd_idx=-1
+args=("$@")
+subcmd=""
+subcmd_idx=-1
+
+# Parse global git flags to find subcommand
 i=0
 while (( i < ${#args[@]} )); do
   a="${args[i]}"
   case "$a" in
     --*=*) ((i+=1)); continue ;;
-    -C|-c|--exec-path|--html-path|--man-path|--info-path|--git-dir|--work-tree|--namespace|--super-prefix) ((i+=2)); continue ;;
+    -C|-c|--exec-path|--html-path|--man-path|--info-path|--git-dir|--work-tree|--namespace|--super-prefix)
+      ((i+=2)); continue ;;
     --) ((i+=1)); break ;;
     -*) ((i+=1)); continue ;;
     *) subcmd="$a"; subcmd_idx=$i; break ;;
@@ -364,7 +380,9 @@ done
 should_gate=0
 if [[ -n "$subcmd" ]]; then
   case "$subcmd" in
-    reset|revert|checkout|restore) should_gate=1 ;;
+    reset|revert|checkout|restore)
+      should_gate=1
+      ;;
     clean)
       for arg in "${args[@]}"; do
         [[ "$arg" == "-f" || "$arg" == "--force" ]] && { should_gate=1; break; }
@@ -390,8 +408,94 @@ fi
 
 exec "$REAL_GIT" "${args[@]}"
 EOF
+
   chmod 0755 "$dst"
 }
+
+# =============================================================================
+# CLI TOGGLE (safeexec)
+# =============================================================================
+
+install_safeexec_cli() {
+  ensure_dir_0755 "$SAFEEXEC_DIR"
+  local cli="$SAFEEXEC_DIR/safeexec"
+
+  cat >"$cli" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_DIR_USER="${XDG_CONFIG_HOME:-$HOME/.config}/safeexec"
+STATE_FILE_USER="$STATE_DIR_USER/disabled"
+STATE_FILE_GLOBAL="/usr/local/safeexec/disabled"
+
+lc() { tr '[:upper:]' '[:lower:]'; }
+
+cmd="${1:-status}"
+cmd="$(printf '%s' "$cmd" | lc)"
+
+global=0
+if [[ "${2:-}" == "--global" || "${2:-}" == "-g" ]]; then
+  global=1
+fi
+
+if [[ "$global" -eq 1 ]]; then
+  [[ "${EUID:-$(id -u)}" -eq 0 ]] || { echo "safeexec: --global requires sudo" >&2; exit 1; }
+  mkdir -p "/usr/local/safeexec"
+  case "$cmd" in
+    -on|on|enable|-enable)
+      rm -f "$STATE_FILE_GLOBAL" 2>/dev/null || true
+      echo "safeexec: ON (global)"
+      ;;
+    -off|off|disable|-disable)
+      : >"$STATE_FILE_GLOBAL"
+      echo "safeexec: OFF (global)"
+      ;;
+    status|st|-status|-st)
+      [[ -f "$STATE_FILE_GLOBAL" ]] && echo "safeexec: OFF (global)" || echo "safeexec: ON (global)"
+      ;;
+    *)
+      echo "Usage: safeexec -on|-off|status [--global]" >&2
+      exit 2
+      ;;
+  esac
+  exit 0
+fi
+
+case "$cmd" in
+  -on|on|enable|-enable)
+    rm -f "$STATE_FILE_USER" 2>/dev/null || true
+    echo "safeexec: ON"
+    ;;
+  -off|off|disable|-disable)
+    mkdir -p "$STATE_DIR_USER"
+    : >"$STATE_FILE_USER"
+    echo "safeexec: OFF"
+    ;;
+  status|st|-status|-st)
+    [[ -f "$STATE_FILE_USER" ]] && echo "safeexec: OFF" || echo "safeexec: ON"
+    ;;
+  *)
+    echo "Usage: safeexec -on|-off|status [--global]" >&2
+    exit 2
+    ;;
+esac
+EOF
+
+  chmod 0755 "$cli"
+
+  # Prefer exposing via /usr/local/bin
+  ensure_dir_0755 "$LOCALBIN"
+  ln -sf "$cli" "$LOCALBIN/safeexec"
+}
+
+remove_safeexec_cli() {
+  rm -f "$LOCALBIN/safeexec" 2>/dev/null || true
+  rm -f "$SAFEEXEC_DIR/safeexec" 2>/dev/null || true
+}
+
+# =============================================================================
+# SHIMS (soft mode)
+# =============================================================================
 
 install_localbin_shims() {
   ensure_dir_0755 "$LOCALBIN"
@@ -409,17 +513,19 @@ install_localbin_shims() {
       continue
     fi
 
-    if [[ -L "$target" ]] && ! symlink_points_to "$target" "$src"; then
-      if [[ "$c" == "git" ]] && is_darwin && is_homebrew_git_symlink "$target"; then
-        if [[ -e "$backup" ]]; then
-          echo "safeexec: WARNING: $backup already exists; not modifying $target."
-          continue
-        fi
-        mv "$target" "$backup"
-        ln -s "$src" "$target"
-        echo "safeexec: backed up Homebrew git symlink ($target -> $backup) and installed safeexec shim."
+    # Special-case: Homebrew git symlink in /usr/local/bin on Intel macOS
+    if [[ "$c" == "git" ]] && is_darwin && [[ -L "$target" ]] && ! symlink_points_to "$target" "$src" && is_homebrew_git_symlink "$target"; then
+      if [[ -e "$backup" ]]; then
+        echo "safeexec: WARNING: $backup already exists; not modifying $target."
         continue
       fi
+      mv "$target" "$backup"
+      ln -s "$src" "$target"
+      echo "safeexec: installed Intel Homebrew git shim at $target (backup: $backup)"
+      continue
+    fi
+
+    if [[ -L "$target" ]] && ! symlink_points_to "$target" "$src"; then
       echo "safeexec: WARNING: $target is a symlink not managed by safeexec; leaving it alone."
       continue
     fi
@@ -439,9 +545,11 @@ remove_localbin_shims() {
       rm -f "$target"
     fi
 
-    if [[ -e "$backup" ]]; then
+    # Restore Intel Homebrew git backup if present and target missing
+    if [[ "$c" == "git" ]] && [[ -e "$backup" ]]; then
       if [[ ! -e "$target" ]]; then
         mv "$backup" "$target"
+        echo "safeexec: restored $target from $backup"
       else
         echo "safeexec: WARNING: not restoring $backup because $target exists."
       fi
@@ -449,13 +557,31 @@ remove_localbin_shims() {
   done
 }
 
+# macOS: ensure /opt/homebrew/bin/git hits safeexec (Apple Silicon)
 install_homebrew_git_shim() {
   is_darwin || return 0
   [[ -e "$HOMEBREW_GIT" ]] || return 0
+
   ensure_dir_0755 "$HOMEBREW_BIN"
 
-  if [[ -e "$HOMEBREW_GIT_REAL" ]]; then
+  # Already shimmed?
+  if [[ -e "$HOMEBREW_GIT_REAL" ]] && file_has_marker "$HOMEBREW_GIT" "$MARK_BREW"; then
     return 0
+  fi
+
+  if [[ -e "$HOMEBREW_GIT_REAL" ]]; then
+    echo "safeexec: WARNING: $HOMEBREW_GIT_REAL exists but $HOMEBREW_GIT is not our shim; leaving it alone."
+    return 0
+  fi
+
+  # Capture owner/group of the existing entry (symlink usually owned by the brew user)
+  local uid gid
+  uid=""
+  gid=""
+  if command -v stat >/dev/null 2>&1; then
+    # macOS stat
+    uid="$(stat -f '%u' "$HOMEBREW_GIT" 2>/dev/null || true)"
+    gid="$(stat -f '%g' "$HOMEBREW_GIT" 2>/dev/null || true)"
   fi
 
   if ! mv "$HOMEBREW_GIT" "$HOMEBREW_GIT_REAL"; then
@@ -469,6 +595,12 @@ install_homebrew_git_shim() {
 exec "$SAFEEXEC_DIR/git" "\$@"
 EOF
   chmod 0755 "$HOMEBREW_GIT"
+
+  if [[ -n "$uid" && -n "$gid" ]]; then
+    chown "$uid:$gid" "$HOMEBREW_GIT" 2>/dev/null || true
+    chown "$uid:$gid" "$HOMEBREW_GIT_REAL" 2>/dev/null || true
+  fi
+
   echo "safeexec: installed Homebrew git shim at $HOMEBREW_GIT (backup: $HOMEBREW_GIT_REAL)"
 }
 
@@ -485,54 +617,18 @@ remove_homebrew_git_shim() {
   fi
 }
 
-install_safeexec_cli() {
-  ensure_dir_0755 "$LOCALBIN"
-  local dst="$LOCALBIN/safeexec"
-  cat >"$dst" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-
-STATE_DIR_USER="${XDG_CONFIG_HOME:-$HOME/.config}/safeexec"
-STATE_FILE_USER="$STATE_DIR_USER/disabled"
-STATE_FILE_GLOBAL="/usr/local/safeexec/disabled"
-
-lc() { tr '[:upper:]' '[:lower:]'; }
-cmd="${1:-status}"
-cmd="$(printf '%s' "$cmd" | lc)"
-
-global=0
-if [[ "${2:-}" == "--global" || "${2:-}" == "-g" ]]; then global=1; fi
-
-if [[ "$global" -eq 1 ]]; then
-  [[ "${EUID:-$(id -u)}" -eq 0 ]] || { echo "safeexec: --global requires sudo" >&2; exit 1; }
-  mkdir -p "/usr/local/safeexec"
-  case "$cmd" in
-    -on|on|enable|-enable) rm -f "$STATE_FILE_GLOBAL" 2>/dev/null || true; echo "safeexec: ON (global)" ;;
-    -off|off|disable|-disable) : >"$STATE_FILE_GLOBAL"; echo "safeexec: OFF (global)" ;;
-    status|st|-status|-st) [[ -f "$STATE_FILE_GLOBAL" ]] && echo "safeexec: OFF (global)" || echo "safeexec: ON (global)" ;;
-    *) echo "Usage: safeexec -on|-off|status [--global]" >&2; exit 2 ;;
-  esac
-  exit 0
-fi
-
-case "$cmd" in
-  -on|on|enable|-enable) rm -f "$STATE_FILE_USER" 2>/dev/null || true; echo "safeexec: ON" ;;
-  -off|off|disable|-disable) mkdir -p "$STATE_DIR_USER"; : >"$STATE_FILE_USER"; echo "safeexec: OFF" ;;
-  status|st|-status|-st) [[ -f "$STATE_FILE_USER" ]] && echo "safeexec: OFF" || echo "safeexec: ON" ;;
-  *) echo "Usage: safeexec -on|-off|status [--global]" >&2; exit 2 ;;
-esac
-EOF
-  chmod 0755 "$dst"
-}
-
-remove_safeexec_cli() { rm -f "$LOCALBIN/safeexec" || true; }
+# =============================================================================
+# Sudo secure_path
+# =============================================================================
 
 install_sudo_secure_path() {
   [[ -d /etc/sudoers.d ]] || return 0
-  local tmp_sudo; tmp_sudo="$(mktemp)"
+  local tmp_sudo
+  tmp_sudo="$(mktemp)"
   cat >"$tmp_sudo" <<EOF
 Defaults secure_path="$SAFEEXEC_DIR:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 EOF
+
   if command -v visudo >/dev/null 2>&1; then
     if visudo -cf "$tmp_sudo"; then
       mv "$tmp_sudo" "$SUDOERS_FILE"
@@ -548,20 +644,35 @@ EOF
   fi
 }
 
-remove_sudo_secure_path() { rm -f "$SUDOERS_FILE" || true; }
+remove_sudo_secure_path() {
+  rm -f "$SUDOERS_FILE" 2>/dev/null || true
+}
+
+# =============================================================================
+# Ubuntu/Debian/WSL hard mode (dpkg-divert)
+# =============================================================================
 
 dpkg_divert_install_one() {
   local cmd="$1"
   command -v dpkg-divert >/dev/null 2>&1 || die "dpkg-divert not found (hard mode requires Ubuntu/Debian/WSL)."
-  local sys_path=""; sys_path="$(command -p -v "$cmd" 2>/dev/null || true)"
+
+  local sys_path=""
+  sys_path="$(command -p -v "$cmd" 2>/dev/null || true)"
   [[ -n "$sys_path" ]] || die "Cannot locate system $cmd via command -p."
-  command -v readlink >/dev/null 2>&1 && sys_path="$(readlink -f "$sys_path" 2>/dev/null || echo "$sys_path")"
+
+  if command -v readlink >/dev/null 2>&1; then
+    sys_path="$(readlink -f "$sys_path" 2>/dev/null || echo "$sys_path")"
+  fi
+
   local divert="${sys_path}.safeexec.real"
+
   if [[ -e "$divert" ]] && file_has_marker "$sys_path" "$MARK_HARD"; then
     echo "safeexec: hard-mode already active for $cmd at $sys_path"
     return 0
   fi
+
   dpkg-divert --add --rename --divert "$divert" "$sys_path"
+
   cat >"$sys_path" <<EOF
 #!/usr/bin/env bash
 # $MARK_HARD ($cmd)
@@ -569,17 +680,28 @@ exec "$SAFEEXEC_DIR/$cmd" "\$@"
 EOF
   chmod 0755 "$sys_path"
   chown root:root "$sys_path" 2>/dev/null || true
+
   echo "safeexec: hard-mode installed for $cmd at $sys_path (real: $divert)"
 }
 
 dpkg_divert_remove_one() {
   local cmd="$1"
   command -v dpkg-divert >/dev/null 2>&1 || die "dpkg-divert not found."
-  local sys_path=""; sys_path="$(command -p -v "$cmd" 2>/dev/null || true)"
+
+  local sys_path=""
+  sys_path="$(command -p -v "$cmd" 2>/dev/null || true)"
   [[ -n "$sys_path" ]] || sys_path="/usr/bin/$cmd"
-  command -v readlink >/dev/null 2>&1 && sys_path="$(readlink -f "$sys_path" 2>/dev/null || echo "$sys_path")"
+
+  if command -v readlink >/dev/null 2>&1; then
+    sys_path="$(readlink -f "$sys_path" 2>/dev/null || echo "$sys_path")"
+  fi
+
   local divert="${sys_path}.safeexec.real"
-  if [[ -f "$sys_path" ]] && file_has_marker "$sys_path" "$MARK_HARD"; then rm -f "$sys_path"; fi
+
+  if [[ -f "$sys_path" ]] && file_has_marker "$sys_path" "$MARK_HARD"; then
+    rm -f "$sys_path"
+  fi
+
   if [[ -e "$divert" ]]; then
     dpkg-divert --remove --rename --divert "$divert" "$sys_path"
     echo "safeexec: hard-mode removed for $cmd at $sys_path"
@@ -588,17 +710,42 @@ dpkg_divert_remove_one() {
   fi
 }
 
+hard_mode_status_one() {
+  local cmd="$1"
+  local p=""
+  p="$(command -p -v "$cmd" 2>/dev/null || true)"
+  [[ -n "$p" ]] || p="/usr/bin/$cmd"
+
+  if command -v readlink >/dev/null 2>&1; then
+    p="$(readlink -f "$p" 2>/dev/null || echo "$p")"
+  fi
+
+  local divert="${p}.safeexec.real"
+  if [[ -e "$divert" ]] && file_has_marker "$p" "$MARK_HARD"; then
+    echo "$cmd hard-mode:    [YES] ($p)"
+  else
+    echo "$cmd hard-mode:    [NO]"
+  fi
+}
+
 cmd_install_hard() {
   need_root
   is_linux || die "install-hard is only supported on Ubuntu/Debian/WSL Linux (dpkg-divert)."
-  confirm_tty_or_die "[SAFEEXEC HARD MODE] This will dpkg-divert /usr/bin/rm and /usr/bin/git so they ALWAYS route through safeexec (non-interactive + command -p + absolute paths)."
+
+  echo "safeexec: HARD MODE will divert /usr/bin/rm and /usr/bin/git. This is system-wide."
+  echo 'safeexec: Type "confirm" to proceed.'
+  read -r reply || true
+  [[ "$reply" == "confirm" ]] || die "Cancelled."
+
   write_wrapper_rm
   write_wrapper_git
   install_safeexec_cli
   install_sudo_secure_path
   install_localbin_shims
+
   dpkg_divert_install_one rm
   dpkg_divert_install_one git
+
   echo "safeexec: HARD MODE active."
 }
 
@@ -610,31 +757,13 @@ cmd_uninstall_hard() {
   echo "safeexec: HARD MODE removed."
 }
 
-hard_mode_status_one() {
-  local cmd="$1"
-  local p=""; p="$(command -p -v "$cmd" 2>/dev/null || true)"; [[ -n "$p" ]] || p="/usr/bin/$cmd"
-  command -v readlink >/dev/null 2>&1 && p="$(readlink -f "$p" 2>/dev/null || echo "$p")"
-  local divert="${p}.safeexec.real"
-  if [[ -e "$divert" ]] && file_has_marker "$p" "$MARK_HARD"; then
-    echo "$cmd hard-mode:    [YES] ($p)"
-  else
-    echo "$cmd hard-mode:    [NO]"
-  fi
-}
-
-cleanup_dotfiles() {
-  if is_darwin; then
-    sudo /usr/bin/sed -i '' '/# SAFEEXEC BEGIN/,/# SAFEEXEC END/d' /etc/zprofile /etc/zshrc /etc/profile 2>/dev/null || true
-    /usr/bin/sed -i '' '/# SAFEEXEC BEGIN/,/# SAFEEXEC END/d' "$HOME/.zprofile" "$HOME/.zshrc" "$HOME/.bash_profile" "$HOME/.bashrc" "$HOME/.profile" 2>/dev/null || true
-  else
-    sudo sed -i.bak '/# SAFEEXEC BEGIN/,/# SAFEEXEC END/d' /etc/profile /etc/bash.bashrc /etc/bashrc /etc/zprofile /etc/zshrc 2>/dev/null || true
-    sed -i.bak '/# SAFEEXEC BEGIN/,/# SAFEEXEC END/d' "$HOME/.zprofile" "$HOME/.zshrc" "$HOME/.bash_profile" "$HOME/.bashrc" "$HOME/.profile" 2>/dev/null || true
-  fi
-  echo "safeexec: removed SAFEEXEC BEGIN/END blocks from common shell init files (best-effort)."
-}
+# =============================================================================
+# Commands
+# =============================================================================
 
 cmd_install() {
   need_root
+
   write_wrapper_rm
   write_wrapper_git
   install_safeexec_cli
@@ -644,10 +773,11 @@ cmd_install() {
 
   echo "safeexec: installed wrappers in $SAFEEXEC_DIR"
   echo "safeexec: shims in $LOCALBIN (rm/git)"
-  if is_darwin && [[ -e "$HOMEBREW_GIT_REAL" ]]; then
+  if is_darwin && [[ -e "$HOMEBREW_GIT_REAL" ]] && file_has_marker "$HOMEBREW_GIT" "$MARK_BREW"; then
     echo "safeexec: Homebrew git shim active at $HOMEBREW_GIT"
   fi
   echo "safeexec: toggle with: safeexec -on | safeexec -off"
+  echo "safeexec: if command not found, run: /usr/local/bin/safeexec status"
   echo "safeexec: for current shell: hash -r"
   if is_linux; then
     echo "safeexec: for Codex/agents on Ubuntu/WSL, enable hard mode: sudo ./safeexec.sh install-hard"
@@ -661,12 +791,14 @@ cmd_uninstall() {
   remove_safeexec_cli
   remove_sudo_secure_path
 
-  rm -f "$SAFEEXEC_DIR/rm" "$SAFEEXEC_DIR/git" || true
+  rm -f "$SAFEEXEC_DIR/rm" "$SAFEEXEC_DIR/git" 2>/dev/null || true
   rmdir "$SAFEEXEC_DIR" 2>/dev/null || true
   rmdir "$SAFEEXEC_ROOT" 2>/dev/null || true
 
   echo "safeexec: uninstalled (soft mode)."
-  echo "safeexec: if you enabled hard mode, also run: sudo ./safeexec.sh uninstall-hard"
+  if is_linux; then
+    echo "safeexec: if you enabled hard mode, also run: sudo ./safeexec.sh uninstall-hard"
+  fi
 }
 
 cmd_status() {
@@ -674,9 +806,12 @@ cmd_status() {
   rm_path="$(command -v rm 2>/dev/null || true)"
   git_path="$(command -v git 2>/dev/null || true)"
 
+  echo "safeexec version: $VERSION"
   echo "SAFEEXEC_DIR=$SAFEEXEC_DIR"
+
   [[ -x "$SAFEEXEC_DIR/rm" ]] && echo "rm wrapper:       [OK]" || echo "rm wrapper:       [MISSING]"
   [[ -x "$SAFEEXEC_DIR/git" ]] && echo "git wrapper:      [OK]" || echo "git wrapper:      [MISSING]"
+  [[ -x "$SAFEEXEC_DIR/safeexec" ]] && echo "safeexec cli:     [OK]" || echo "safeexec cli:     [MISSING]"
   [[ -f "$SUDOERS_FILE" ]] && echo "sudoers:          [OK]" || echo "sudoers:          [MISSING]"
 
   for c in rm git; do
@@ -688,15 +823,9 @@ cmd_status() {
     fi
   done
 
-  echo -n "PATH includes SAFEEXEC_DIR: "
-  if [[ ":${PATH:-}:" == *":$SAFEEXEC_DIR:"* ]]; then
-    echo "[YES]"
-  else
-    echo "[NO] (OK if shims win)"
-  fi
-
   echo "which rm:  ${rm_path:-n/a}"
   echo "which git: ${git_path:-n/a}"
+  echo "which safeexec: $(command -v safeexec 2>/dev/null || echo n/a)"
 
   echo -n "effective gate rm:  "
   [[ "$rm_path" == "$SAFEEXEC_DIR/rm" || "$rm_path" == "$LOCALBIN/rm" ]] && echo "[YES]" || echo "[NO]"
@@ -715,7 +844,9 @@ cmd_status() {
     hard_mode_status_one git
   fi
 
-  command -v safeexec >/dev/null 2>&1 && safeexec status || true
+  if command -v safeexec >/dev/null 2>&1; then
+    safeexec status || true
+  fi
 }
 
 main() {
@@ -726,7 +857,6 @@ main() {
     status) cmd_status ;;
     install-hard) cmd_install_hard ;;
     uninstall-hard) cmd_uninstall_hard ;;
-    cleanup-dotfiles) cleanup_dotfiles ;;
     *) usage ;;
   esac
 }
