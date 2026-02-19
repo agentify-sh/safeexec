@@ -12,6 +12,7 @@ It intercepts dangerous commands (like `rm -rf` or `git reset --hard`) and enfor
     *   **Always blocked:** `git reset` (soft/mixed/hard), `git revert`, `git checkout`, `git restore`.
     *   **Blocked if forced:** `git clean -f`, `git switch -f`, `git switch --discard-changes`.
     *   **Blocked stashes:** `git stash drop`, `git stash clear`, `git stash pop`.
+*   **Package Manager Audit-Fix Gating:** Intercepts `npm`, `yarn`, `pnpm`, and `bun` invocations when they match `audit fix --force` (including `--fix --force` variants).
 *   **Sudo Protection:** Updates `secure_path` to ensure `sudo rm -rf` is also intercepted.
 *   **Audit Logging:** Logs all intercepted and confirmed actions to the system syslog.
 *   **Fail-Safe:** Checks for `visudo` and `logger` availability to prevent system corruption during install.
@@ -55,14 +56,23 @@ $ git reset --hard HEAD~1
 Type "confirm" to execute:
 ```
 
+**Example: npm Audit Force-Fix**
+```bash
+$ npm audit fix --force
+
+[SAFEEXEC] DESTRUCTIVE COMMAND INTERCEPTED:
+  npm audit fix --force
+Type "confirm" to execute:
+```
+
 To proceed, you must type `confirm` and hit Enter. Any other input (or closing the terminal) aborts the command with exit code `130`.
 
 ## ⚙️ How It Works
 
 1.  **Path Precedence:** It creates wrapper scripts in `/usr/local/safeexec/bin`.
-2.  **Profile Hooks:** It prepends this directory to the `$PATH` via `/etc/profile.d` and `.bashrc`.
+2.  **Homebrew Compatibility (macOS):** It installs backup/restore shims under `/opt/homebrew/bin` for `git`, `npm`, `yarn`, `pnpm`, and `bun` when present.
 3.  **Sudoers Shim:** It creates `/etc/sudoers.d/safeexec` to modify the `secure_path`, forcing `sudo` commands to respect the wrappers.
-4.  **Local Bin Shims:** It creates symlinks in `/usr/local/bin` (e.g., `/usr/local/bin/rm`) as a secondary catchment layer for scripts using that path.
+4.  **Local Bin Shims:** It creates symlinks in `/usr/local/bin` (e.g., `/usr/local/bin/rm`, `/usr/local/bin/npm`) as a secondary catchment layer for scripts using that path.
 5.  **Arguments Parsing:** It uses robust Bash argument parsing to distinguish between harmless flags (like `--work-tree=/tmp`) and destructive subcommands.
 
 ## ⚠️ Emergency Bypass
@@ -86,8 +96,16 @@ If the wrapper is preventing a legitimate automated task (e.g., a cron job) or y
 SAFEEXEC_DIR=/usr/local/safeexec/bin
 rm wrapper:       [OK]
 git wrapper:      [OK]
+npm wrapper:      [OK]
+yarn wrapper:     [OK]
+pnpm wrapper:     [OK]
+bun wrapper:      [OK]
 sudoers:          [OK]
 /usr/local/bin/rm shim: [OK]
 /usr/local/bin/git shim: [OK]
+/usr/local/bin/npm shim: [OK]
+/usr/local/bin/yarn shim: [OK]
+/usr/local/bin/pnpm shim: [OK]
+/usr/local/bin/bun shim: [OK]
 PATH includes SAFEEXEC_DIR: [YES]
 ```
