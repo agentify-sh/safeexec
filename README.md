@@ -4,6 +4,16 @@
 
 It intercepts dangerous commands (like `rm -rf` or `git reset --hard`) and enforces an interactive **confirmation gate** via `/dev/tty`. This prevents automated scripts or piped commands from bypassing safety checks.
 
+## 🎯 Vibecoder Scope
+
+SafeExec is intentionally built for vibecoders running AI agents in local shells.
+
+*   **Not a sandbox:** SafeExec is not a VM/container/cgroup replacement.
+*   **What it protects:** Accidental destructive commands in human + AI terminal sessions.
+*   **What it does not protect:** Sandbox escape prevention, malware containment, or full host isolation.
+*   **Why wrap binaries:** Only specific destructive patterns are gated; normal command behavior passes through.
+*   **Automation intent:** Use explicit scoped bypass for automation when needed (examples below).
+
 ## 🛡️ Features
 
 *   **TTY-Based Confirmation:** Requires the user to manually type `confirm` to proceed. It explicitly ignores `echo confirm | command` pipes.
@@ -15,6 +25,13 @@ It intercepts dangerous commands (like `rm -rf` or `git reset --hard`) and enfor
 *   **Sudo Protection:** Updates `secure_path` to ensure `sudo rm -rf` is also intercepted.
 *   **Audit Logging:** Logs all intercepted and confirmed actions to the system syslog.
 *   **Fail-Safe:** Checks for `visudo` and `logger` availability to prevent system corruption during install.
+
+## 🪟 Windows Support
+
+SafeExec works for Windows users through **WSL** (recommended: Ubuntu on WSL2).
+
+*   Supported: WSL shell sessions (`bash`, `zsh`) where agent commands run.
+*   Not currently targeted: native PowerShell/CMD binary wrapping.
 
 ## 🚀 Installation
 
@@ -32,6 +49,16 @@ You must run the script as **root**.
 
 3.  **Activate:**
     Close your current shell session and open a new one (or run `hash -r`) to pick up the new `$PATH`.
+
+### Windows (WSL) Quick Start
+
+Inside your WSL distro:
+
+```bash
+chmod +x safeexec.sh
+sudo ./safeexec.sh install
+hash -r
+```
 
 ## 📖 Usage
 
@@ -73,6 +100,10 @@ If the wrapper is preventing a legitimate automated task (e.g., a cron job) or y
 # Bypass the wrapper explicitly
 /bin/rm -rf /tmp/junk
 /usr/bin/git reset --hard
+
+# Scoped bypass for automation
+SAFEEXEC_DISABLED=1 rm -rf /tmp/junk
+SAFEEXEC_DISABLED=1 git reset --hard
 ```
 
 ## Uninstall
